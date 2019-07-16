@@ -24,6 +24,16 @@ from urllib.request import urlopen
 from tensorflow.python.ops import array_ops
 import mobilenet_v2
 
+def _HERE(*args):
+  """Helper function for getting the current directory of this script."""
+  h = os.path.dirname(os.path.realpath(__file__))
+  return os.path.abspath(os.path.join(h, *args))
+
+sys.path.append(_HERE()+"/efficient_net")
+sys.path.append(_HERE()+"/autoaugment")
+from efficientnet import EfficientNet
+from autoaugment import ImageNetPolicy, CIFAR10Policy, SVHNPolicy
+
 tf.logging.set_verbosity(tf.logging.ERROR)
 
 class Model(object):
@@ -71,7 +81,7 @@ class Model(object):
     # Get model function from class method below
     model_fn = self.model_fn
     # Classifier using model_fn
-    ws = tf.estimator.WarmStartSettings(ckpt_to_initialize_from="./submission/",
+    ws = tf.estimator.WarmStartSettings(ckpt_to_initialize_from=os.path.join(_HERE(),"pretrained_models/mobile"),
                       vars_to_warm_start="(?=.*Mobilenet)(?=^(?!.*Logits)).*")
     tensor_shape = metadata.get_tensor_shape()
     if tensor_shape[3] == 3:
