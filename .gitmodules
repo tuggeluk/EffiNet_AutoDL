@@ -1,0 +1,3 @@
+[submodule "modules/autodl_starting_kit_stable"]
+	path = modules/autodl_starting_kit_stable
+	url = https://github.com/zhengying-liu/autodl_starting_kit_stable.git
