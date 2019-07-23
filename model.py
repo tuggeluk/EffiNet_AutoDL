@@ -81,7 +81,7 @@ class Model(object):
     self.FirstIteration = True
     self.learning_rate = tf.placeholder(tf.float32)
     self.batch_size = 64
-    self.max_edge = 64
+    self.max_edge = 128
 
     self.lr = 0.001
     self.wd = 1e-5
@@ -95,7 +95,7 @@ class Model(object):
 
     self.hard_resize = None
     self.no_pad_resize = False
-    self.py_data_processing = True
+    self.py_data_processing = False
     #self.pretain_path = os.path.join(_HERE(),"pretrained_models/res18")
     self.pretain_path = os.path.join(_HERE(), "pretrained_models/eff/efficientnet-b0")
 
@@ -401,7 +401,8 @@ class Model(object):
           # resize to given shape such that aspect ratio is preserved and both edges fit shape
           # pad the rest
           TfResize = lambda x : tf.squeeze(tf.image.resize_image_with_pad(
-            tf.expand_dims(x, 0),
+            #tf.expand_dims(x, 0),
+            x,
             resize_shape[0],
             resize_shape[1],
             method=tf.image.ResizeMethod.BILINEAR

@@ -3,8 +3,8 @@ import os
 
 
 
-l_rate = [0.05, 0.01, 0.001, 0.0005, 0.0001]
-w_decay = [0.005, 0.0005, 0.00005, 0]
+l_rate = [0.0005]
+w_decay = [0.00002]
 #datasets = ["Hammer/", "Pedro/", "Decal/", "Chucky/", "cifar100/"]
 datasets = ["Hammer/"]
 
