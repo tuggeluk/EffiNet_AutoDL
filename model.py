@@ -11,33 +11,52 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# Modified by: Zhengying Liu, Isabelle Guyon, Heung-Chang Lee, Do-Guk Kim
+# Modified by: Zhengying Liu, Isabelle Guyon
 
+"""An example of code submission for the AutoDL challenge.
+
+It implements 3 compulsory methods ('__init__', 'train' and 'test') and
+an attribute 'done_training' for indicating if the model will not proceed more
+training due to convergence or limited time budget.
+
+To create a valid submission, zip model.py together with other necessary files
+such as Python modules/packages, pre-trained weights. The final zip file should
+not exceed 300MB.
+"""
+import sys
+
+
+from tensorflow.python.client import device_lib
+from sklearn.metrics import accuracy_score
+from sklearn.metrics import roc_auc_score
 
 import logging
+
 import numpy as np
-import os
-import sys
-import tensorflow as tf
-import time
-from urllib.request import urlopen
-from tensorflow.python.ops import array_ops
-import mobilenet_v2
 
 def _HERE(*args):
   """Helper function for getting the current directory of this script."""
   h = os.path.dirname(os.path.realpath(__file__))
   return os.path.abspath(os.path.join(h, *args))
 
-sys.path.append(_HERE()+"/efficient_net")
+
+LearningRate = 0.0010000000 
+Momentum = 0.9000000000 
+Regularization = 0.0000100000 
+
+import os
+import tensorflow as tf
+sys.path.append("./python_packages")
+sys.path.append(_HERE()+"/efficientnet")
 sys.path.append(_HERE()+"/autoaugment")
+sys.path.append(_HERE()+"/res18")
 from efficientnet import EfficientNet
 from autoaugment import ImageNetPolicy, CIFAR10Policy, SVHNPolicy
-
-tf.logging.set_verbosity(tf.logging.ERROR)
+from resnet import ResNet
+from PIL import Image
 
 class Model(object):
-  """Construct a model with 3D CNN for classification."""
+  """Trivial example of valid model. Returns all-zero predictions."""
 
   def __init__(self, metadata):
     """
@@ -48,47 +67,394 @@ class Model(object):
     self.done_training = False
     self.metadata = metadata
 
-    # Get the output dimension, i.e. number of classes
-    self.output_dim = self.metadata.get_output_size()
-    # Set batch size (for both training and testing)
-    self.batch_size = 50
+    self.train_iterator = None
+    self.train_iterator_handle = None
+    self.test_iterator = None
+    self.test_iterator_handle = None
 
-    # Attributes for preprocessing
-    self.default_image_size = (112,112)
-    self.default_num_frames = 10
-    self.default_shuffle_buffer = 100
+    self.train_data = None
+    self.train_labels = None
+    self.test_data = None
 
-    # Attributes for managing time budget
-    # Cumulated number of training steps
-    self.birthday = time.time()
-    self.total_train_time = 0
-    self.cumulated_num_steps = 0
-    self.estimated_time_per_step = None
-    self.total_test_time = 0
-    self.cumulated_num_tests = 0
-    self.train_cnt = 0
-    self.estimated_time_test = None
-    # Critical number for early stopping
-    self.num_epochs_we_want_to_train = 100
-    self.image_size = metadata.get_matrix_size()
-    if self.image_size[0] > 224:
-        self.image_size = (224,224)
-    if self.image_size[0] < 0 or self.image_size[1] < 0:
-        self.image_size = self.default_image_size
+    self.augment_policy = None
+
+    self.FirstIteration = True
+    self.learning_rate = tf.placeholder(tf.float32)
+    self.batch_size = 64
+    self.max_edge = 64
+
+    self.lr = 0.001
+    self.wd = 1e-5
+
+    text_file = open("config.txt", "r")
+    conf = text_file.read()
+    text_file.close()
+    conf = conf.split("_")
+    self.lr = float(conf[0])
+    self.wd = float(conf[1])
+
+    self.hard_resize = None
+    self.no_pad_resize = False
+    self.py_data_processing = True
+    #self.pretain_path = os.path.join(_HERE(),"pretrained_models/res18")
+    self.pretain_path = os.path.join(_HERE(), "pretrained_models/eff/efficientnet-b0")
+
+    #tf.reset_default_graph()
+    self.tf_session = tf.Session(config=tf.ConfigProto(log_device_placement=False))
+
+    # Show system inf o
+    logger.info("System info ('uname -a'):")
+    os.system('uname -a')
+    # Show available devices
+    local_device_protos = device_lib.list_local_devices()
+    logger.info("Available local devices:\n{}".format(local_device_protos))
+    # Show CUDA version
+    logger.info("CUDA version:")
+    os.system('nvcc --version')
+    logger.info("Output of the command line 'nvclock':")
+    os.system('nvclock')
     
-    self.input_size = min(self.image_size[0], self.image_size[1])
+  def np_one_hot(self, preds):
+    b = np.zeros((preds.shape[0], self.number_of_labels))
+    b[np.arange(preds.shape[0]), preds.astype(dtype=np.int32)] = 1
+    return b
     
-    # Get model function from class method below
-    model_fn = self.model_fn
-    # Classifier using model_fn
-    ws = tf.estimator.WarmStartSettings(ckpt_to_initialize_from=os.path.join(_HERE(),"pretrained_models/mobile"),
-                      vars_to_warm_start="(?=.*Mobilenet)(?=^(?!.*Logits)).*")
-    tensor_shape = metadata.get_tensor_shape()
-    if tensor_shape[3] == 3:
-      self.classifier = tf.estimator.Estimator(model_fn=model_fn, warm_start_from=ws)
+  def color(self, x):
+    x = tf.image.random_hue(x, 0.08)
+    x = tf.image.random_saturation(x, 0.6, 1.6)
+    x = tf.image.random_brightness(x, 0.05)
+    x = tf.image.random_contrast(x, 0.7, 1.3)
+    return x
+    
+
+
+  def model(self, images, keep_prob=1.0, number_of_classes=2, is_training=True):
+
+    self.number_of_labels = self.metadata.get_output_size()
+    self.dropout = tf.placeholder(tf.float32)
+    self.is_training = tf.placeholder(tf.bool)
+    # create the base pre-trained model
+
+    net = images
+    if self.metadata.get_tensor_size()[-1] != 3:
+      with tf.variable_scope("Preprocessing"):
+        net = tf.layers.conv2d(net, filters=3, kernel_size=[3, 3], padding="SAME")
+
+
+    #** Efficient Net **
+    base_model = EfficientNet(model_name="efficientnet-b0", num_classes=256)
+
+    #use no specific scope
+    net, endpoints = base_model.model(net, True)
+    net = endpoints["block_15/expansion_output"]
+    #net = tf.layers.flatten(net)
+    net = tf.reduce_mean(net, [1, 2])
+
+    with tf.variable_scope("FullyConnected"):
+      # if self.isMultilabel:
+      #   net = tf.contrib.layers.fully_connected(net, num_outputs=self.number_of_labels*2)
+      #   #net = tf.layers.dropout(net, rate=self.dropout)
+      #   net = tf.reshape(net, [-1, self.number_of_labels, 2])
+      # else:
+      #   net = tf.contrib.layers.fully_connected(net, num_outputs=self.number_of_labels)
+      #   #net = tf.layers.dropout(net, rate=self.dropout)
+      # net = tf.layers.dropout(
+      #   inputs=net, rate=0.3,
+      #   training=self.is_training)
+      net = tf.layers.dense(inputs=net, units=256, activation=tf.nn.relu)
+      net = tf.layers.dropout(
+        inputs=net, rate=0.5,
+        training=self.is_training)
+      net = tf.layers.dense(inputs=net, units=self.number_of_labels)
+
+    # **Resnet-18**
+    # base_model = ResNet(tf.train.get_global_step(), self.is_training, self.number_of_labels)
+    # net = base_model.build_tower(net)
+
+
+
+          
+    logits = net
+    probabilities = tf.nn.sigmoid(logits, name="sigmoid_tensor")
+
+    return logits, probabilities
+
+
+  def multilabel_loss_compute(self, labels, logits):
+    one_hot_labels = tf.one_hot(indices=tf.cast(labels, dtype=tf.uint8), depth=2)
+    logits = tf.nn.softmax(logits, axis=-1)+1e-6
+    loss0 = tf.divide(tf.reduce_sum(tf.multiply(tf.reduce_sum(tf.multiply(one_hot_labels, -tf.log(logits)), axis=-1), 1-labels)), 1e-6+tf.reduce_sum(1-labels))
+    loss1 = tf.divide(tf.reduce_sum(tf.multiply(tf.reduce_sum(tf.multiply(one_hot_labels, -tf.log(logits)), axis=-1),   labels)), 1e-6+tf.reduce_sum(  labels))  
+    return tf.add(loss0, loss1)
+
+
+  def multiclass_loss_compute(self,labels,logits, weights=None):
+    if weights is None:
+      loss = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits_v2(labels=labels, logits=logits))
     else:
-      self.classifier = tf.estimator.Estimator(model_fn=model_fn)
-    
+      weighted_logits = tf.multiply(weights, logits)
+      loss = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits_v2(labels=labels, logits=weighted_logits))
+    return loss
+
+  def sigmoid_cross_entropy_with_logits(self, labels=None, logits=None):
+    """Re-implementation of this function:
+      https://www.tensorflow.org/api_docs/python/tf/nn/sigmoid_cross_entropy_with_logits
+
+    Let z = labels, x = logits, then return the sigmoid cross entropy
+      max(x, 0) - x * z + log(1 + exp(-abs(x)))
+    (Then sum over all classes.)
+    """
+    labels = tf.cast(labels, dtype=tf.float32)
+    relu_logits = tf.nn.relu(logits)
+    exp_logits = tf.exp(- tf.abs(logits))
+    sigmoid_logits = tf.log(1 + exp_logits)
+    element_wise_xent = relu_logits - labels * logits + sigmoid_logits
+
+    return tf.reduce_sum(element_wise_xent)
+
+
+  def AddRegularizationLoss(self, regularization):
+    self.trainable_variables = tf.global_variables()
+    self.reg_loss = tf.Variable(initial_value=0, dtype=tf.float32, trainable=False)
+    for item in self.trainable_variables:
+      if not "bias" in item.name:
+        self.reg_loss = tf.add(self.reg_loss, tf.nn.l2_loss(item))
+    return tf.add(self.loss, regularization*self.reg_loss)
+
+
+  def TrainOp(self, loss, scope=None, learning_rate=0.256, momentum=0.9, optimizer=tf.train.MomentumOptimizer):
+    optimizer = tf.train.RMSPropOptimizer(learning_rate=learning_rate, momentum=0.9, decay=0.9, epsilon=1e-3)
+    var_list = tf.global_variables()  # tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope=scope)
+    self.reg_loss = tf.Variable(initial_value=0, dtype=tf.float32, trainable=False)
+    for item in var_list:
+      self.reg_loss = tf.add(self.reg_loss, tf.nn.l2_loss(item))
+    update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS, scope=scope)
+    with tf.control_dependencies(update_ops):
+      # with tf.variable_scope("Optimizer", reuse=tf.AUTO_REUSE):
+      gvs = optimizer.compute_gradients(loss)
+      capped_gvs = [(tf.clip_by_value(grad, -1., 1.), var) for grad, var in gvs]
+      train_op = optimizer.apply_gradients(capped_gvs)
+      # train_op = optimizer.minimize(loss, var_list=var_list)
+    with tf.control_dependencies([train_op]):
+      optimizer2 = tf.train.MomentumOptimizer(learning_rate=1e-5 / 2, momentum=0)
+      train_op2 = optimizer2.minimize(self.reg_loss, var_list=var_list)
+    return tf.group(train_op, train_op2)
+
+  def simple_TrainOp(self, loss):
+    optimizer = tf.train.AdamOptimizer(0.001)
+    train_op = optimizer.minimize(
+      loss=loss,
+      global_step=tf.train.get_global_step())
+    return train_op
+
+
+  def TrainOp_EffiNet(self, loss):
+    optimizer = tf.contrib.opt.AdamWOptimizer(
+    weight_decay=self.wd,
+    learning_rate=self.lr,
+    beta1=0.9,
+    beta2=0.999,
+    epsilon=1e-08,
+    use_locking=False,
+    name='AdamW'
+    )
+    train_op = optimizer.minimize(
+      loss=loss,
+      global_step=tf.train.get_global_step())
+    return train_op
+
+
+  def prepare_dataset(self, dataset, is_test=False, resize_shape=None, resize_no_pad=False, py_data_processing=False):
+
+    if not is_test:
+      # get mean size:
+      if min(self.metadata.get_tensor_size()) > 1:
+        dataset = dataset.batch(200).prefetch(1)
+      iterator = dataset.make_one_shot_iterator()
+      next_element = iterator.get_next()
+
+      examples_input = list()
+      examples_labels = list()
+      with tf.Session() as sess:
+        try:
+          while True:  # load full dataset
+            tensor_4d, y = sess.run(next_element)
+            examples_input.append(np.array(tensor_4d).astype(dtype=np.float16))
+            examples_labels.append(y)
+        except:
+          print("full dataset loaded at init")
+      # detect task and estimate class imbalance
+
+      if min(self.metadata.get_tensor_size()) > 1:
+          examples_labels = np.concatenate(examples_labels)
+          examples_single = list()
+          for inp in examples_input:
+              inp = np.squeeze(inp)
+              examples_single.extend(np.split(inp,inp.shape[0], axis=0))
+          examples_input = examples_single
+      else:
+          examples_labels = np.stack(examples_labels)
+
+      if examples_labels.sum() == examples_labels.shape[0]:
+        self.isMultilabel = False
+      else:
+        self.isMultilabel = True
+
+      logger.info("*********** Detected multilabel:  " + str(self.isMultilabel) + " ***********************")
+
+      est_class_distribution = examples_labels.sum(axis=0) / examples_labels.sum()
+      balance_weights = (1 / est_class_distribution)
+      balance_weights = balance_weights / np.sum(balance_weights) * self.metadata.get_output_size()  # let the weights spread around 1
+      self.balance_weights = balance_weights
+
+      logger.info("Estimated class distribution:  " + str(est_class_distribution))
+      shapes = np.array([x.shape for x in examples_input])
+      self.mean_sizes = np.average(shapes, 0)[1:3]
+
+      # transpose to agree with tensorflow definition
+      self.mean_sizes  = self.mean_sizes[::-1]
+
+      logger.info("Estimated mean size:  " + str(self.mean_sizes))
+
+    if is_test and py_data_processing:
+      # get mean size:
+      if min(self.metadata.get_tensor_size()) > 1:
+        dataset = dataset.batch(200).prefetch(1)
+      iterator = dataset.make_one_shot_iterator()
+      next_element = iterator.get_next()
+
+      examples_input = list()
+      examples_labels = list()
+      with tf.Session() as sess:
+        try:
+          while True:  # load full dataset
+            tensor_4d, y = sess.run(next_element)
+            examples_input.append(np.array(tensor_4d).astype(dtype=np.float16))
+            examples_labels.append(y)
+        except:
+          print("full dataset loaded at init")
+      # detect task and estimate class imbalance
+
+
+      if min(self.metadata.get_tensor_size()) > 1:
+          examples_labels = np.concatenate(examples_labels)
+          examples_single = list()
+          for inp in examples_input:
+              inp = np.squeeze(inp)
+              examples_single.extend(np.split(inp, inp.shape[0], axis=0))
+          examples_input = examples_single
+      else:
+          examples_labels = np.stack(examples_labels)
+
+    # resize_shape set? --> resize to that shape
+    if resize_shape is None:
+      resize_shape = self.mean_sizes
+    if max(resize_shape)>self.max_edge:
+      resize_shape = (self.mean_sizes/(max(self.mean_sizes)/self.max_edge)).astype(np.int)
+
+
+    # check if resize is necessary:
+    if np.sum(self.metadata.get_tensor_size()[0:2] == resize_shape) !=2:
+      self.input_shape = tuple(resize_shape)+(self.input_shape[-1],)
+      logger.info("resizing to:  " + str(resize_shape))
+      if py_data_processing == True:
+        from PIL import Image, ImageOps
+
+        if resize_no_pad:
+          # hard-resize to given shape
+          for ix, ele in enumerate(examples_input):
+            img = Image.fromarray((ele[0]*256).astype(np.uint8))
+            #img.save("origi.jpg")
+            img = img.resize(resize_shape, Image.BILINEAR)
+            #img.save("resizeovic.jpg")
+            img = np.array(img)/256
+
+            examples_input[ix] = img.transpose((1,0,2)).astype(dtype=np.float16)
+        else:
+          # resize to given shape such that aspect ratio is preserved and both edges fit shape
+          # pad the rest
+          for ix, ele in enumerate(examples_input):
+            resize_coef = np.min(resize_shape / np.array(ele.shape[1:3])[::-1])
+            img = Image.fromarray((ele[0]*256).astype(np.uint8))
+            img = img.resize(tuple(np.floor(np.array(img.size)*resize_coef).astype(np.int)))
+            offsets = (resize_shape - np.array(img.size))/2
+            offsets_fl = np.floor(offsets).astype(np.int)
+            offsets_ceil = np.ceil(offsets).astype(np.int)
+            img = ImageOps.expand(img,(offsets_fl[0], offsets_fl[1], offsets_ceil[0], offsets_ceil[1]))
+            img = np.array(img)/256
+
+            examples_input[ix] = img.transpose((1,0,2)).astype(dtype=np.float16)
+        print("return full dataset instead of handle")
+        examples_input = np.stack(examples_input, 0)
+        examples_labels = np.stack(examples_labels, 0)
+        return [examples_input, examples_labels]
+      else:
+        if resize_no_pad:
+          # hard-resize to given shape
+          TfResize = lambda x: tf.squeeze(tf.image.resize_bilinear(tf.expand_dims(x, 0), resize_shape), 0)
+          def mapFunction_resize(x, y):
+            return tf.map_fn(TfResize, x), y
+          dataset = dataset.map(mapFunction_resize)
+
+        else:
+
+          # resize to given shape such that aspect ratio is preserved and both edges fit shape
+          # pad the rest
+          TfResize = lambda x : tf.squeeze(tf.image.resize_image_with_pad(
+            tf.expand_dims(x, 0),
+            resize_shape[0],
+            resize_shape[1],
+            method=tf.image.ResizeMethod.BILINEAR
+          ), 0)
+
+          def mapFunction_resize(x, y):
+            return tf.map_fn(TfResize, x), y
+          dataset = dataset.map(mapFunction_resize)
+    elif py_data_processing:
+      print("return full dataset instead of handle")
+      examples_input = np.concatenate(examples_input, 0)
+      examples_labels = np.stack(examples_labels, 0)
+      return [examples_input, examples_labels]
+    return dataset
+
+  def get_next_batch(self, is_train = True):
+    if is_train:
+      # check if epoch has been completed
+      if self.train_batch_pointer+self.batch_size > self.train_data.shape[0]:
+        batch_tr = self.train_data[self.train_batch_pointer:self.train_data.shape[0]]
+        batch_lb = self.train_labels[self.train_batch_pointer:self.train_data.shape[0]]
+        self.train_batch_pointer = 0
+        return [batch_tr, batch_lb], True
+      else:
+        point_new = self.train_batch_pointer + self.batch_size
+        batch_tr = self.train_data[self.train_batch_pointer:point_new]
+        batch_lb = self.train_labels[self.train_batch_pointer:point_new]
+        self.train_batch_pointer = point_new
+        return [batch_tr, batch_lb], False
+
+    else:
+      if self.test_batch_pointer + self.batch_size > self.test_data.shape[0]:
+        batch_tr = self.test_data[self.test_batch_pointer:self.test_data.shape[0]]
+        self.test_batch_pointer = 0
+        return [batch_tr], True
+      else:
+        point_new = self.test_batch_pointer + self.batch_size
+        batch_tr = self.test_data[self.test_batch_pointer:point_new]
+        self.test_batch_pointer = point_new
+        return [batch_tr], False
+
+  def auto_augment(self,batch):
+    if batch[0].shape[-1] ==3:
+      for ix in range(0,batch[0].shape[0]):
+        img = Image.fromarray((batch[0][ix]*256).astype(np.uint8))
+        #img.save("pre_transform.jpg")
+        img = self.augment_policy(img)
+        batch[0][ix] = (np.array(img)/256).astype(dtype=np.float16)
+    # else:
+    #    print("Augmentation only works for 3 input channels")
+    return batch
+
+
   def train(self, dataset, remaining_time_budget=None):
     """Train this algorithm on the tensorflow |dataset|.
 
@@ -131,417 +497,222 @@ class Model(object):
       remaining_time_budget: time remaining to execute train(). The method
           should keep track of its execution time to avoid exceeding its time
           budget. If remaining_time_budget is None, no time budget is imposed.
-    """       
-    #print (self.image_size)    
-    # Get number of steps to train according to some strategy
-    steps_to_train = self.get_steps_to_train(remaining_time_budget)
-    
-    
-    # Count examples on training set        
-    if self.train_cnt == 0 and (self.image_size[0] < 0 or self.image_size[1] < 0):      
-      iterator = dataset.make_one_shot_iterator()
-      example, labels = iterator.get_next()
-      need_simple_arch = False
-      with tf.Session() as sess:
-        while True:
-          try:
-            curr = sess.run(example)
-            curr_shape = curr.shape
-            if min(curr_shape[1], curr_shape[2]) <= 28:
-              need_simple_arch = True
-              break                        
-          except tf.errors.OutOfRangeError:
-            break
-      if need_simple_arch:
-        self.input_size = min(curr_shape[1], curr_shape[2])
-        self.classifier = tf.estimator.Estimator(model_fn=self.model_fn)
-    
-    self.num_examples_train = 0
-    if steps_to_train <= 0:
-      logger.info("Not enough time remaining for training. " +
-            "Estimated time for training per step: {:.2f}, "\
-            .format(self.estimated_time_per_step) +
-            "but remaining time budget is: {:.2f}. "\
-            .format(remaining_time_budget) +
-            "Skipping...")
-      self.done_training = True        
-    else:
-      msg_est = ""
-      if self.estimated_time_per_step:
-        msg_est = "estimated time for this: {:.2f} sec."\
-                  .format(steps_to_train * self.estimated_time_per_step)
-      logger.info("Begin training for another {} steps...{}"\
-                  .format(steps_to_train, msg_est))
-      
-      # Prepare input function for training
-      train_input_fn = lambda: self.input_function(dataset, is_training=True)
-      
-      # Start training
-      train_start = time.time()
-      self.classifier.train(input_fn=train_input_fn, steps=steps_to_train)        
-      train_end = time.time()
+    """
 
-      # Update for time budget managing      
-      train_duration = train_end - train_start
-      self.total_train_time += train_duration
-      self.cumulated_num_steps += steps_to_train
-      self.estimated_time_per_step = self.total_train_time / self.cumulated_num_steps
-      logger.info("{} steps trained. {:.2f} sec used. ".format(steps_to_train, train_duration) +\
-            "Now total steps trained: {}. ".format(self.cumulated_num_steps) +\
-            "Total time used for training: {:.2f} sec. ".format(self.total_train_time) +\
-            "Current estimated time per step: {:.2e} sec.".format(self.estimated_time_per_step))
-      self.train_cnt += 1
+    if self.train_iterator_handle is None and self.train_data is None:
+
+      self.input_shape = self.metadata.get_tensor_size()
+      # Reset TF graph
+      dataset = self.prepare_dataset(dataset,is_test=False,resize_shape=self.hard_resize, resize_no_pad=self.no_pad_resize, py_data_processing=self.py_data_processing)
+
+      if self.py_data_processing:
+        print("set up feed placeholders")
+        self.train_data, self.train_labels = dataset
+        self.element = tf.placeholder(tf.float32, shape=[None,]+list(self.input_shape))
+        self.labels = tf.placeholder(tf.float32, shape=[None, self.metadata.get_output_size()])
+
+        self.train_batch_pointer = 0
+        self.test_batch_pointer = 0
+
+      else:
+        # initialize iterators
+        dataset = dataset.batch(self.batch_size).prefetch(1)
+        dataset = dataset.repeat(-1)
+        self.train_iterator = dataset.make_one_shot_iterator()
+        self.train_iterator_handle = self.tf_session.run(self.train_iterator.string_handle())
+
+        # init the model, metrics and training operator:
+        # handle based iterator
+        self.iterator_feed_handle = tf.placeholder(tf.string, shape=[])
+        iterator = tf.data.Iterator.from_string_handle(
+          self.iterator_feed_handle, self.train_iterator.output_types)
+
+        element, labels = iterator.get_next()
+        self.labels = tf.cast(labels, dtype=tf.float32)
+        self.element = tf.squeeze(element, axis=1)
+
+        #set shape of iterator element such that dense works
+        self.element.set_shape((None,) + self.input_shape)
+
+      #build model
+      logits, predictions = self.model(self.element)
+
+      self.logits = logits
+      # if self.isMultilabel:
+      #   logger.info("Loss function: Mutli-label loss function!")
+      #   self.loss = self.multilabel_loss_compute(self.labels, logits)
+      # else:
+      #   logger.info("Loss function: Softmax Cross Entropy!")
+      #   self.loss = self.multiclass_loss_compute(self.labels, logits, self.balance_weights)
+
+      self.loss = self.sigmoid_cross_entropy_with_logits(self.labels, self.logits)
+
+      #self.AddRegularizationLoss(regularization)
+      self.predictions = tf.cast(predictions, dtype=tf.float32)
+      self.accuracy = tf.reduce_mean(tf.cast(tf.equal(self.labels, self.predictions), dtype=tf.float32))
+      self.recall = tf.divide(tf.reduce_sum(tf.multiply(tf.cast(tf.equal(self.labels, self.predictions), dtype=tf.float32), self.labels)), tf.reduce_sum(self.labels))
       
+      #self.trainOp = self.TrainOp(self.loss, learning_rate=self.learning_rate)
+      self.trainOp = self.TrainOp_EffiNet(self.loss)
+
+      logger.info("Shape of dataset: {}".format(self.metadata.get_tensor_size()))
+      logger.info("Number of input: {}".format(self.input_shape))
+      logger.info("Number of classes: {}".format(self.metadata.get_output_size()))
+
+      # Weights initialization:
+      init_new_vars_op = tf.variables_initializer(tf.global_variables())
+      self.tf_session.run(init_new_vars_op)
+
+      ##############################
+      #   pretrained model(s) here #
+      ##############################
+      # Find the latest checkpoint:
+      latest_checkpoint = tf.train.latest_checkpoint(self.pretain_path)
+
+      # Load pretrained
+      all_variables = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES)
+      all_variables = [x for x in all_variables
+                       if "Adam" not in x.name
+                       and "FullyConnected" not in x.name
+                       and "Preprocessing" not in x.name
+                       and "_power" not in x.name
+                       and "head" not in x.name]
+      saver1 = tf.train.Saver(var_list=all_variables)
+      saver1.restore(self.tf_session, latest_checkpoint)
+    
+      # Create the Saveru:
+      # var_list = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES)
+      # update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
+      # #saver = tf.train.Saver(var_list=var_list+update_ops)
+      # saver = tf.train.Saver()
+      # if latest_checkpoint is None:
+      #   self.tf_session.run(init_new_vars_op)
+      # else:
+      #   try:
+      #     saver.restore(self.tf_session, latest_checkpoint)
+      #   except:
+      #     logger.info("only restore scope Model")
+      #     self.tf_session.run(init_new_vars_op)
+      #     var_list2 = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope="Model")
+      #     update_ops2 = tf.get_collection(tf.GraphKeys.UPDATE_OPS, scope="Model")
+      #     saver = tf.train.Saver(var_list=var_list2+update_ops2)
+      #     saver.restore(self.tf_session, latest_checkpoint)
+      #     saver = tf.train.Saver(var_list=var_list+update_ops)
+      # self.saver = saver
+    
+    # Restoring the checkpoint or initialize the weights and start the training:
+    sample_count = 0
+    while sample_count < int(600): # when do we return?
+      try:
+        if self.py_data_processing:
+          # feed images directly
+          batch,_ = self.get_next_batch(is_train = True)
+          if self.augment_policy is not None:
+            batch = self.auto_augment(batch)
+          _loss, _labels, _predictions, _logits, _ = self.tf_session.run([self.loss, self.labels, self.predictions, self.logits, self.trainOp],
+                                                                         feed_dict={self.element:batch[0], self.labels:batch[1], self.dropout: 0.5, self.learning_rate: 1e-6, self.is_training: True})
+
+        else:
+          # use tf.data iterator
+          _loss, _labels, _predictions, _logits, _ = self.tf_session.run([self.loss, self.labels, self.predictions, self.logits, self.trainOp],
+                                                                         feed_dict={self.iterator_feed_handle: self.train_iterator_handle, self.dropout: 0.5, self.learning_rate: 1e-6, self.is_training: True})
+        _predictions = np.argmax(_predictions,-1)
+        sample_count += 1
+        try:
+          all_labels = np.concatenate((all_labels), _labels, axis=0)
+          all_predictions = np.concatenate((all_predictions, _predictions), axis=0)
+        except:
+          all_labels = _labels
+          all_predictions = _predictions
+        if sample_count % 20 == 0:
+          if len(all_predictions.shape) < 2:
+              all_predictions = self.np_one_hot(all_predictions)                   
+          try:
+              _BAC = roc_auc_score(all_labels, all_predictions)
+          except ValueError:
+              _BAC = 0
+          _accuracy = accuracy_score(all_labels, all_predictions)
+          all_labels = 0
+          all_predictions = 0
+          logger.info("Training step: {:05d}, accuracy: {:0.5f}, AUC: {:0.5f}, loss: {:0.5f}.".format(sample_count, _accuracy, _BAC, _loss))
+
+
+      except tf.errors.OutOfRangeError:
+        print("tf out of range Error")
+        break
+    logger.info("Number of training examples: {}".format(sample_count))
+
+    self.done_training = False
 
   def test(self, dataset, remaining_time_budget=None):
-    """Test this algorithm on the tensorflow |dataset|.
+    """Make predictions on the test set `dataset` (which is different from that
+    of the method `train`).
 
     Args:
-      Same as that of `train` method, except that the `labels` will be empty.
+      Same as that of `train` method, except that the `labels` will be empty
+          since this time `dataset` is a test set.
     Returns:
       predictions: A `numpy.ndarray` matrix of shape (sample_count, output_dim).
           here `sample_count` is the number of examples in this dataset as test
           set and `output_dim` is the number of labels to be predicted. The
           values should be binary or in the interval [0,1].
     """
-    test_begin = time.time()
-    logger.info("Begin testing... ")
+    if self.test_iterator_handle is None and self.test_data is None:
+      if self.hard_resize is not None:
+        tar_size = self.hard_resize
+      else:
+        tar_size = self.mean_sizes
+      dataset = self.prepare_dataset(dataset, is_test=True, resize_shape=tar_size, resize_no_pad=self.no_pad_resize, py_data_processing=self.py_data_processing)
 
-    # Prepare input function for testing
-    test_input_fn = lambda: self.input_function(dataset, is_training=False)
+      if self.py_data_processing:
+        self.test_data = dataset[0]
+      else:
+        dataset = dataset.batch(self.batch_size).prefetch(1)
+        self.test_iterator = dataset.make_initializable_iterator()
+        self.test_iterator_handle = self.tf_session.run(self.test_iterator.string_handle())
 
-    # Start testing (i.e. making prediction on test set)
-    test_results = self.classifier.predict(input_fn=test_input_fn)
+    if not self.py_data_processing:
+      self.tf_session.run(self.test_iterator.initializer)
 
-    predictions = [x['probabilities'] for x in test_results]
-    predictions = np.array(predictions)
-    test_end = time.time()
-    # Update some variables for time management
-    test_duration = test_end - test_begin
-    self.total_test_time += test_duration
-    self.cumulated_num_tests += 1
-    self.estimated_time_test = self.total_test_time / self.cumulated_num_tests
-    logger.info("Successfully made one prediction. {:.2f} sec used. ".format(test_duration) +\
-          "Total time used for testing: {:.2f} sec. ".format(self.total_test_time) +\
-          "Current estimated time for test: {:.2e} sec.".format(self.estimated_time_test))
+    # Restoring the checkpoint and start the evaluation:
+    all_predictions = np.zeros([1, self.metadata.get_output_size()])
+    sample_count = 0
+    while True:
+      try:
+        if self.py_data_processing:
+          batch, epoch_done = self.get_next_batch(is_train=False)
+          _predictions = self.tf_session.run(self.predictions, feed_dict={self.element: batch[0], self.dropout: 0, self.is_training: False})
+        else:
+          _predictions = self.tf_session.run(self.predictions, feed_dict={self.iterator_feed_handle: self.test_iterator_handle, self.dropout: 0, self.is_training: False})
+        if len(_predictions.shape) < 2:
+          all_predictions =np.concatenate((all_predictions, self.np_one_hot(_predictions)), axis=0)
+        else: 
+          all_predictions =np.concatenate((all_predictions, _predictions), axis=0)
+        sample_count += 1
+        #print("sample_count "+ str(sample_count))
+        if self.py_data_processing and epoch_done:
+          break
+      except tf.errors.OutOfRangeError:
+        break
+    logger.info("Number of test examples: {}".format(sample_count))
+    predictions = all_predictions[1:, :]
+    #predictions = np.ones(predictions.shape)
+
+    # if self.isMultilabel==False:
+    #   predictions = self.np_one_hot(np.argmax(predictions, 1))
+
+    #self.saver.save(self.tf_session, os.path.join(self.pretain_path+"/continued", "model.ckpt"))
+
+    self.FirstIteration = False
     return predictions
 
   ##############################################################################
   #### Above 3 methods (__init__, train, test) should always be implemented ####
   ##############################################################################
 
-  # Model functions that contain info on neural network architectures
-  # Several model functions are to be implemented, for different domains
-  
-  def model_fn(self, features, labels, mode):
-    """Auto-Scaling 3D CNN model.
-
-    For more information on how to write a model function, see:
-      https://www.tensorflow.org/guide/custom_estimators#write_a_model_function
-    """
-    input_layer = features
-
-    # Replace missing values by 0
-    hidden_layer = tf.where(tf.is_nan(input_layer),
-                           tf.zeros_like(input_layer), input_layer)
-    
-
-    if self.input_size > 28:
-        hidden_layer = tf.squeeze(hidden_layer, axis=[1])
-        with tf.contrib.slim.arg_scope(mobilenet_v2.training_scope(is_training=True)):
-            logits, endpoints = mobilenet_v2.mobilenet(hidden_layer, self.input_size)
-        hidden_layer = tf.contrib.layers.conv2d(
-                inputs=endpoints['feature_maps'], num_outputs=1280, kernel_size=1, stride=1, activation_fn=None)
-        hidden_layer = tf.reduce_mean(input_tensor=hidden_layer, axis=[1, 2])
-    else:
-        REASONABLE_NUM_ENTRIES = 1000
-        num_filters = 32 # The number of filters is fixed
-        while True:
-          shape = hidden_layer.shape
-          kernel_size = [min(3, shape[1]), min(3, shape[2]), min(3, shape[3])]
-          hidden_layer = tf.layers.conv3d(inputs=hidden_layer,
-                                          filters=num_filters,
-                                          kernel_size=kernel_size)
-          kernel_size = [min(1, shape[1]), min(1, shape[2]), min(1, shape[3])]
-          hidden_layer = tf.layers.conv3d(inputs=hidden_layer,
-                                          filters=num_filters,
-                                          kernel_size=kernel_size)    
-          pool_size = [min(2, shape[1]), min(2, shape[2]), min(2, shape[3])]
-          hidden_layer= tf.layers.max_pooling3d(inputs=hidden_layer,
-                                                pool_size=pool_size,
-                                                strides=pool_size,
-                                                padding='valid',
-                                                data_format='channels_last')
-          if get_num_entries(hidden_layer) < REASONABLE_NUM_ENTRIES:
-            break 
-        hidden_layer = tf.layers.flatten(hidden_layer)
-        
-    hidden_layer = tf.layers.dense(inputs=hidden_layer,
-                                   units=256, activation=tf.nn.relu)
-    hidden_layer = tf.layers.dropout(
-        inputs=hidden_layer, rate=0.5,
-        training=mode == tf.estimator.ModeKeys.TRAIN)
-
-    logits = tf.layers.dense(inputs=hidden_layer, units=self.output_dim)
-    sigmoid_tensor = tf.nn.sigmoid(logits, name="sigmoid_tensor")
-
-    predictions = {
-      # Generate predictions (for PREDICT and EVAL mode)
-      "classes": tf.argmax(input=logits, axis=1),
-      # "classes": binary_predictions,
-      # Add `sigmoid_tensor` to the graph. It is used for PREDICT and by the
-      # `logging_hook`.
-      "probabilities": sigmoid_tensor
-    }
-
-    if mode == tf.estimator.ModeKeys.PREDICT:
-      return tf.estimator.EstimatorSpec(mode=mode, predictions=predictions)
-
-    # Calculate Loss (for both TRAIN and EVAL modes)
-    # For multi-label classification, a correct loss is sigmoid cross entropy
-    loss = sigmoid_cross_entropy_with_logits(labels=labels, logits=logits)
-    #loss = focal_loss(prediction_tensor=logits, target_tensor=labels)
-
-    # Configure the Training Op (for TRAIN mode)
-    if mode == tf.estimator.ModeKeys.TRAIN:
-      optimizer = tf.train.AdamOptimizer(0.001)      
-      train_op = optimizer.minimize(
-          loss=loss,
-          global_step=tf.train.get_global_step())
-      return tf.estimator.EstimatorSpec(mode=mode, loss=loss, train_op=train_op)
-
-    # Add evaluation metrics (for EVAL mode)
-    assert mode == tf.estimator.ModeKeys.EVAL
-    eval_metric_ops = {
-        "accuracy": tf.metrics.accuracy(
-            labels=labels, predictions=predictions["classes"])}
-    return tf.estimator.EstimatorSpec(
-        mode=mode, loss=loss, eval_metric_ops=eval_metric_ops)
-
-
-  def input_function(self, dataset, is_training):
-    """Given `dataset` received by the method `self.train` or `self.test`,
-    prepare input to feed to model function.
-
-    For more information on how to write an input function, see:
-      https://www.tensorflow.org/guide/custom_estimators#write_an_input_function
-    """
-    
-    dataset = dataset.map(lambda *x: (self.preprocess_tensor_4d(x[0]), x[1]))
-
-    if is_training:
-      # Shuffle input examples
-      dataset = dataset.shuffle(buffer_size=self.default_shuffle_buffer)
-      # Convert to RepeatDataset to train for several epochs
-      dataset = dataset.repeat()
-
-    # Set batch size
-    dataset = dataset.batch(batch_size=self.batch_size)
-
-    iterator = dataset.make_one_shot_iterator()
-    example, labels = iterator.get_next()
-    return example, labels
-
-  def preprocess_tensor_4d(self, tensor_4d):
-    """Preprocess a 4-D tensor (only when some dimensions are `None`, i.e.
-    non-fixed). The output tensor wil have fixed, known shape.
-
-    Args:
-      tensor_4d: A Tensor of shape
-          [sequence_size, row_count, col_count, num_channels]
-          where some dimensions might be `None`.
-    Returns:
-      A 4-D Tensor with fixed, known shape.
-    """
-    tensor_4d_shape = tensor_4d.shape
-    logger.info("Tensor shape before preprocessing: {}".format(tensor_4d_shape))
-
-    if tensor_4d_shape[0] > 0 and tensor_4d_shape[0] < 10:
-      num_frames = tensor_4d_shape[0]
-    else:
-      num_frames = self.default_num_frames
-    
-    '''
-    if self.output_dim in [6, 10]:
-      new_row_count = 28
-    elif tensor_4d_shape[1] > 0:
-#       if tensor_4d_shape[1] > 224:
-#         new_row_count = 224
-#       else:
-        #new_row_count = tensor_4d_shape[1]
-        new_row_count = self.default_image_size[0]
-    else:
-      new_row_count=self.default_image_size[0]
-    if self.output_dim in [6, 10]:
-      new_col_count = 28
-#     elif self.output_dim in [3, 26]:
-#       new_col_count = 56
-    elif tensor_4d_shape[2] > 0:
-#       if tensor_4d_shape[2] > 224:
-#         new_col_count = 224
-#       else:
-        #new_col_count = tensor_4d_shape[2]
-        new_col_count = self.default_image_size[1]
-    else:
-      new_col_count=self.default_image_size[1]
-    '''
-    
-    new_row_count, new_col_count = self.image_size[0], self.image_size[1]
-    
-    if not tensor_4d_shape[0] > 0:
-      logger.info("Detected that examples have variable sequence_size, will " +
-                "randomly crop a sequence with num_frames = " +
-                "{}".format(num_frames))
-      tensor_4d = crop_time_axis(tensor_4d, num_frames=num_frames)
-    if not tensor_4d_shape[1] > 0 or not tensor_4d_shape[2] > 0:
-      logger.info("Detected that examples have variable space size, will " +
-                "resize space axes to (new_row_count, new_col_count) = " +
-                "{}".format((new_row_count, new_col_count)))
-    tensor_4d = resize_space_axes(tensor_4d,
-                                  new_row_count=new_row_count,
-                                  new_col_count=new_col_count)
-    logger.info("Tensor shape after preprocessing: {}".format(tensor_4d.shape))    
-    
-    return tensor_4d
-
-  def get_steps_to_train(self, remaining_time_budget):
-    """Get number of steps for training according to `remaining_time_budget`.
-
-    The strategy is:
-      1. If no training is done before, train for 10 steps (ten batches);
-      2. Otherwise, estimate training time per step and time needed for test,
-         then compare to remaining time budget to compute a potential maximum
-         number of steps (max_steps) that can be trained within time budget;
-      3. Choose a number (steps_to_train) between 0 and max_steps and train for
-         this many steps. Double it each time.
-    """
-    if not remaining_time_budget: # This is never true in the competition anyway
-      remaining_time_budget = 1200 # if no time limit is given, set to 20min
-
-    image_max_len = max(self.image_size[0], self.image_size[1])
-    adaptive_batch = 100
-    if not self.estimated_time_per_step:
-      steps_to_train = adaptive_batch
-    else:
-      if self.estimated_time_test:
-        tentative_estimated_time_test = self.estimated_time_test
-      else:
-        tentative_estimated_time_test = 50 # conservative estimation for test
-      max_steps = int((remaining_time_budget - tentative_estimated_time_test) / self.estimated_time_per_step)
-      max_steps = max(max_steps, 1)
-      if self.cumulated_num_tests < np.log(max_steps) / np.log(2):
-        steps_to_train = int(adaptive_batch * (1.5 ** self.cumulated_num_tests)) # Double steps_to_train after each test
-      else:
-        steps_to_train = 0
-      
-    return steps_to_train
-
-  def age(self):
-    return time.time() - self.birthday
-
-  def choose_to_stop_early(self):
-    """The criterion to stop further training (thus finish train/predict
-    process).
-    """
-    batch_size = self.batch_size
-    num_examples = self.num_examples_train
-    num_epochs = self.cumulated_num_steps * batch_size / num_examples
-    logger.info("Model already trained for {} epochs.".format(num_epochs))
-    return num_epochs > self.num_epochs_we_want_to_train # Train for at least certain number of epochs then stop
-
-def sigmoid_cross_entropy_with_logits(labels=None, logits=None):
-  """Re-implementation of this function:
-    https://www.tensorflow.org/api_docs/python/tf/nn/sigmoid_cross_entropy_with_logits
-
-  Let z = labels, x = logits, then return the sigmoid cross entropy
-    max(x, 0) - x * z + log(1 + exp(-abs(x)))
-  (Then sum over all classes.)
-  """
-  labels = tf.cast(labels, dtype=tf.float32)
-  relu_logits = tf.nn.relu(logits)
-  exp_logits = tf.exp(- tf.abs(logits))
-  sigmoid_logits = tf.log(1 + exp_logits)
-  element_wise_xent = relu_logits - labels * logits + sigmoid_logits
-        
-  return tf.reduce_sum(element_wise_xent)
-
-def focal_loss(prediction_tensor, target_tensor, weights=None, alpha=0.5, gamma=5):  
-  sigmoid_p = tf.nn.sigmoid(prediction_tensor)
-  zeros = array_ops.zeros_like(sigmoid_p, dtype=sigmoid_p.dtype)
-    
-  pos_p_sub = array_ops.where(target_tensor > zeros, target_tensor - sigmoid_p, zeros)
-    
-  neg_p_sub = array_ops.where(target_tensor > zeros, zeros, sigmoid_p)
-  per_entry_cross_ent = - alpha * (pos_p_sub ** gamma) * tf.log(tf.clip_by_value(sigmoid_p, 1e-8, 1.0)) - (1 - alpha) * (neg_p_sub ** gamma) * tf.log(tf.clip_by_value(1.0 - sigmoid_p, 1e-8, 1.0))
-
-  return tf.reduce_sum(per_entry_cross_ent)
-
-def get_num_entries(tensor):
-  """Return number of entries for a TensorFlow tensor.
-
-  Args:
-    tensor: a tf.Tensor or tf.SparseTensor object of shape
-        (batch_size, sequence_size, row_count, col_count[, num_channels])
-  Returns:
-    num_entries: number of entries of each example, which is equal to
-        sequence_size * row_count * col_count [* num_channels]
-  """
-  tensor_shape = tensor.shape
-  assert(len(tensor_shape) > 1)
-  num_entries  = 1
-  for i in tensor_shape[1:]:
-    num_entries *= int(i)
-  return num_entries
-
-def crop_time_axis(tensor_4d, num_frames, begin_index=None):
-  """Given a 4-D tensor, take a slice of length `num_frames` on its time axis.
-
-  Args:
-    tensor_4d: A Tensor of shape
-        [sequence_size, row_count, col_count, num_channels]
-    num_frames: An integer representing the resulted chunk (sequence) length
-    begin_index: The index of the beginning of the chunk. If `None`, chosen
-      randomly.
-  Returns:
-    A Tensor of sequence length `num_frames`, which is a chunk of `tensor_4d`.
-  """
-  # pad sequence if not long enough
-  pad_size = tf.maximum(num_frames - tf.shape(tensor_4d)[1], 0)
-  padded_tensor = tf.pad(tensor_4d, ((0, pad_size), (0, 0), (0, 0), (0, 0)))
-
-  # If not given, randomly choose the beginning index of frames
-  if not begin_index:
-    maxval = tf.shape(padded_tensor)[0] - num_frames + 1
-    begin_index = tf.random.uniform([1],
-                                    minval=0,
-                                    maxval=maxval,
-                                    dtype=tf.int32)
-    begin_index = tf.stack([begin_index[0], 0, 0, 0], name='begin_index')
-
-  sliced_tensor = tf.slice(padded_tensor,
-                           begin=begin_index,
-                           size=[num_frames, -1, -1, -1])
-
-  return sliced_tensor
-
-def resize_space_axes(tensor_4d, new_row_count, new_col_count):
-  """Given a 4-D tensor, resize space axes to have target size.
-
-  Args:
-    tensor_4d: A Tensor of shape
-        [sequence_size, row_count, col_count, num_channels].
-    new_row_count: An integer indicating the target row count.
-    new_col_count: An integer indicating the target column count.
-  Returns:
-    A Tensor of shape [sequence_size, target_row_count, target_col_count].
-  """
-  resized_images = tf.image.resize_images(tensor_4d,
-                                          size=(new_row_count, new_col_count))
-  return resized_images
-
 def get_logger(verbosity_level):
   """Set logging format to something like:
-       2019-04-25 12:52:51,924 INFO model.py: <message>
+       2019-04-25 12:52:51,924 INFO score.py: <message>
   """
   logger = logging.getLogger(__file__)
   logging_level = getattr(logging, verbosity_level)
@@ -560,4 +731,3 @@ def get_logger(verbosity_level):
   return logger
 
 logger = get_logger('INFO')
-

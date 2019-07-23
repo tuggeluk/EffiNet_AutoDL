@@ -20,9 +20,9 @@ class EfficientNet(object):
 
         #is_train = (is_training == tf.estimator.ModeKeys.TRAIN)
         is_train=True
-        logits, _ = efficientnet_builder.build_model(x, self.model_name, is_train,override_params=self.params)
+        logits, endpoints = efficientnet_builder.build_model(x, self.model_name, is_train,override_params=self.params)
         self.scores= logits
-        return logits
+        return logits, endpoints
 
     def score(self):
         return self.scores
