@@ -46,14 +46,19 @@ Regularization = 0.0000100000
 
 import os
 import tensorflow as tf
-sys.path.append("./python_packages")
+#sys.path.append("./python_packages")
 sys.path.append(_HERE()+"/efficientnet")
-sys.path.append(_HERE()+"/autoaugment")
-sys.path.append(_HERE()+"/res18")
+#sys.path.append(_HERE()+"/autoaugment")
+#sys.path.append(_HERE()+"/res18")
 from efficientnet import EfficientNet
-from autoaugment import ImageNetPolicy, CIFAR10Policy, SVHNPolicy
-from resnet import ResNet
-from PIL import Image
+#from autoaugment import ImageNetPolicy, CIFAR10Policy, SVHNPolicy
+#from resnet import ResNet
+
+import threading
+threads = [
+    threading.Thread(target=lambda: tf.Session())
+]
+[t.start() for t in threads]
 
 class Model(object):
   """Trivial example of valid model. Returns all-zero predictions."""
@@ -81,25 +86,32 @@ class Model(object):
     self.FirstIteration = True
     self.learning_rate = tf.placeholder(tf.float32)
     self.batch_size = 64
-    self.max_edge = 128
+    self.max_edge = 256
 
     self.lr = 0.001
     self.wd = 1e-5
 
-    text_file = open("config.txt", "r")
+    self.fc_size = 256
+
+    text_file = open("config.txt",  "r")
     conf = text_file.read()
     text_file.close()
     conf = conf.split("_")
     self.lr = float(conf[0])
     self.wd = float(conf[1])
+    self.max_edge = int(conf[2])
+    self.fc_size = int(conf[3])
+
+    self.do_multilabel_check = True
 
     self.hard_resize = None
     self.no_pad_resize = False
-    self.py_data_processing = False
+
     #self.pretain_path = os.path.join(_HERE(),"pretrained_models/res18")
     self.pretain_path = os.path.join(_HERE(), "pretrained_models/eff/efficientnet-b0")
 
     #tf.reset_default_graph()
+    [t.join() for t in threads]
     self.tf_session = tf.Session(config=tf.ConfigProto(log_device_placement=False))
 
     # Show system inf o
@@ -119,13 +131,7 @@ class Model(object):
     b[np.arange(preds.shape[0]), preds.astype(dtype=np.int32)] = 1
     return b
     
-  def color(self, x):
-    x = tf.image.random_hue(x, 0.08)
-    x = tf.image.random_saturation(x, 0.6, 1.6)
-    x = tf.image.random_brightness(x, 0.05)
-    x = tf.image.random_contrast(x, 0.7, 1.3)
-    return x
-    
+
 
 
   def model(self, images, keep_prob=1.0, number_of_classes=2, is_training=True):
@@ -161,7 +167,7 @@ class Model(object):
       # net = tf.layers.dropout(
       #   inputs=net, rate=0.3,
       #   training=self.is_training)
-      net = tf.layers.dense(inputs=net, units=256, activation=tf.nn.relu)
+      net = tf.layers.dense(inputs=net, units=self.fc_size, activation=tf.nn.relu)
       net = tf.layers.dropout(
         inputs=net, rate=0.5,
         training=self.is_training)
@@ -264,20 +270,22 @@ class Model(object):
     return train_op
 
 
-  def prepare_dataset(self, dataset, is_test=False, resize_shape=None, resize_no_pad=False, py_data_processing=False):
+  def prepare_dataset(self, dataset, is_test=False, resize_shape=None, resize_no_pad=False):
 
-    if not is_test:
+    if not is_test and (self.do_multilabel_check or min(self.metadata.get_tensor_size()) < 1):
       # get mean size:
-      if min(self.metadata.get_tensor_size()) > 1:
-        dataset = dataset.batch(200).prefetch(1)
+
+      #dataset = dataset.batch(1).prefetch(1)
       iterator = dataset.make_one_shot_iterator()
       next_element = iterator.get_next()
 
       examples_input = list()
       examples_labels = list()
+
       with tf.Session() as sess:
         try:
-          while True:  # load full dataset
+          for i in range(25):
+            # load full dataset
             tensor_4d, y = sess.run(next_element)
             examples_input.append(np.array(tensor_4d).astype(dtype=np.float16))
             examples_labels.append(y)
@@ -285,15 +293,15 @@ class Model(object):
           print("full dataset loaded at init")
       # detect task and estimate class imbalance
 
-      if min(self.metadata.get_tensor_size()) > 1:
-          examples_labels = np.concatenate(examples_labels)
-          examples_single = list()
-          for inp in examples_input:
-              inp = np.squeeze(inp)
-              examples_single.extend(np.split(inp,inp.shape[0], axis=0))
-          examples_input = examples_single
-      else:
-          examples_labels = np.stack(examples_labels)
+      # if min(self.metadata.get_tensor_size()) > 1:
+      #     examples_labels = np.concatenate(examples_labels)
+      #     examples_single = list()
+      #     for inp in examples_input:
+      #         inp = np.squeeze(inp)
+      #         examples_single.extend(np.split(inp,inp.shape[0], axis=0))
+      #     examples_input = examples_single
+      # else:
+      examples_labels = np.stack(examples_labels)
 
       if examples_labels.sum() == examples_labels.shape[0]:
         self.isMultilabel = False
@@ -302,158 +310,60 @@ class Model(object):
 
       logger.info("*********** Detected multilabel:  " + str(self.isMultilabel) + " ***********************")
 
-      est_class_distribution = examples_labels.sum(axis=0) / examples_labels.sum()
-      balance_weights = (1 / est_class_distribution)
-      balance_weights = balance_weights / np.sum(balance_weights) * self.metadata.get_output_size()  # let the weights spread around 1
-      self.balance_weights = balance_weights
-
-      logger.info("Estimated class distribution:  " + str(est_class_distribution))
+      # Need to load a lot of data for this!
+      # est_class_distribution = examples_labels.sum(axis=0) / examples_labels.sum()
+      # balance_weights = (1 / est_class_distribution)
+      # balance_weights = balance_weights / np.sum(balance_weights) * self.metadata.get_output_size()  # let the weights spread around 1
+      # self.balance_weights = balance_weights
+      #
+      # logger.info("Estimated class distribution:  " + str(est_class_distribution))
       shapes = np.array([x.shape for x in examples_input])
       self.mean_sizes = np.average(shapes, 0)[1:3]
-
+      self.mean_sizes = self.mean_sizes.astype(np.int)
       # transpose to agree with tensorflow definition
-      self.mean_sizes  = self.mean_sizes[::-1]
+      # self.mean_sizes  = self.mean_sizes[::-1]
 
       logger.info("Estimated mean size:  " + str(self.mean_sizes))
 
-    if is_test and py_data_processing:
-      # get mean size:
-      if min(self.metadata.get_tensor_size()) > 1:
-        dataset = dataset.batch(200).prefetch(1)
-      iterator = dataset.make_one_shot_iterator()
-      next_element = iterator.get_next()
-
-      examples_input = list()
-      examples_labels = list()
-      with tf.Session() as sess:
-        try:
-          while True:  # load full dataset
-            tensor_4d, y = sess.run(next_element)
-            examples_input.append(np.array(tensor_4d).astype(dtype=np.float16))
-            examples_labels.append(y)
-        except:
-          print("full dataset loaded at init")
-      # detect task and estimate class imbalance
-
-
-      if min(self.metadata.get_tensor_size()) > 1:
-          examples_labels = np.concatenate(examples_labels)
-          examples_single = list()
-          for inp in examples_input:
-              inp = np.squeeze(inp)
-              examples_single.extend(np.split(inp, inp.shape[0], axis=0))
-          examples_input = examples_single
-      else:
-          examples_labels = np.stack(examples_labels)
-
     # resize_shape set? --> resize to that shape
     if resize_shape is None:
-      resize_shape = self.mean_sizes
-    if max(resize_shape)>self.max_edge:
-      resize_shape = (self.mean_sizes/(max(self.mean_sizes)/self.max_edge)).astype(np.int)
+      if min(self.metadata.get_tensor_size()) < 1:
+        resize_shape = self.mean_sizes
+      else:
+        resize_shape = np.array(self.metadata.get_tensor_size()[0:2])
+    if max(resize_shape) > self.max_edge:
+      resize_shape = (resize_shape/(max(resize_shape)/self.max_edge)).astype(np.int)
 
 
     # check if resize is necessary:
     if np.sum(self.metadata.get_tensor_size()[0:2] == resize_shape) !=2:
       self.input_shape = tuple(resize_shape)+(self.input_shape[-1],)
       logger.info("resizing to:  " + str(resize_shape))
-      if py_data_processing == True:
-        from PIL import Image, ImageOps
 
-        if resize_no_pad:
-          # hard-resize to given shape
-          for ix, ele in enumerate(examples_input):
-            img = Image.fromarray((ele[0]*256).astype(np.uint8))
-            #img.save("origi.jpg")
-            img = img.resize(resize_shape, Image.BILINEAR)
-            #img.save("resizeovic.jpg")
-            img = np.array(img)/256
+      if resize_no_pad:
+        # hard-resize to given shape
+        TfResize = lambda x: tf.squeeze(tf.image.resize_bilinear(x, resize_shape), 0)
+        def mapFunction_resize(x, y):
+          return tf.map_fn(TfResize, x), y
+        dataset = dataset.map(mapFunction_resize)
 
-            examples_input[ix] = img.transpose((1,0,2)).astype(dtype=np.float16)
-        else:
-          # resize to given shape such that aspect ratio is preserved and both edges fit shape
-          # pad the rest
-          for ix, ele in enumerate(examples_input):
-            resize_coef = np.min(resize_shape / np.array(ele.shape[1:3])[::-1])
-            img = Image.fromarray((ele[0]*256).astype(np.uint8))
-            img = img.resize(tuple(np.floor(np.array(img.size)*resize_coef).astype(np.int)))
-            offsets = (resize_shape - np.array(img.size))/2
-            offsets_fl = np.floor(offsets).astype(np.int)
-            offsets_ceil = np.ceil(offsets).astype(np.int)
-            img = ImageOps.expand(img,(offsets_fl[0], offsets_fl[1], offsets_ceil[0], offsets_ceil[1]))
-            img = np.array(img)/256
-
-            examples_input[ix] = img.transpose((1,0,2)).astype(dtype=np.float16)
-        print("return full dataset instead of handle")
-        examples_input = np.stack(examples_input, 0)
-        examples_labels = np.stack(examples_labels, 0)
-        return [examples_input, examples_labels]
       else:
-        if resize_no_pad:
-          # hard-resize to given shape
-          TfResize = lambda x: tf.squeeze(tf.image.resize_bilinear(tf.expand_dims(x, 0), resize_shape), 0)
-          def mapFunction_resize(x, y):
-            return tf.map_fn(TfResize, x), y
-          dataset = dataset.map(mapFunction_resize)
 
-        else:
+        # resize to given shape such that aspect ratio is preserved and both edges fit shape
+        # pad the rest
+        TfResize = lambda x : tf.image.resize_image_with_pad(
+          #tf.expand_dims(x, 0),
+          x,
+          resize_shape[0],
+          resize_shape[1],
+          method=tf.image.ResizeMethod.BILINEAR
+        )
 
-          # resize to given shape such that aspect ratio is preserved and both edges fit shape
-          # pad the rest
-          TfResize = lambda x : tf.squeeze(tf.image.resize_image_with_pad(
-            #tf.expand_dims(x, 0),
-            x,
-            resize_shape[0],
-            resize_shape[1],
-            method=tf.image.ResizeMethod.BILINEAR
-          ), 0)
-
-          def mapFunction_resize(x, y):
-            return tf.map_fn(TfResize, x), y
-          dataset = dataset.map(mapFunction_resize)
-    elif py_data_processing:
-      print("return full dataset instead of handle")
-      examples_input = np.concatenate(examples_input, 0)
-      examples_labels = np.stack(examples_labels, 0)
-      return [examples_input, examples_labels]
+        def mapFunction_resize(x, y):
+          return tf.map_fn(TfResize, x), y
+        dataset = dataset.map(mapFunction_resize)
     return dataset
 
-  def get_next_batch(self, is_train = True):
-    if is_train:
-      # check if epoch has been completed
-      if self.train_batch_pointer+self.batch_size > self.train_data.shape[0]:
-        batch_tr = self.train_data[self.train_batch_pointer:self.train_data.shape[0]]
-        batch_lb = self.train_labels[self.train_batch_pointer:self.train_data.shape[0]]
-        self.train_batch_pointer = 0
-        return [batch_tr, batch_lb], True
-      else:
-        point_new = self.train_batch_pointer + self.batch_size
-        batch_tr = self.train_data[self.train_batch_pointer:point_new]
-        batch_lb = self.train_labels[self.train_batch_pointer:point_new]
-        self.train_batch_pointer = point_new
-        return [batch_tr, batch_lb], False
-
-    else:
-      if self.test_batch_pointer + self.batch_size > self.test_data.shape[0]:
-        batch_tr = self.test_data[self.test_batch_pointer:self.test_data.shape[0]]
-        self.test_batch_pointer = 0
-        return [batch_tr], True
-      else:
-        point_new = self.test_batch_pointer + self.batch_size
-        batch_tr = self.test_data[self.test_batch_pointer:point_new]
-        self.test_batch_pointer = point_new
-        return [batch_tr], False
-
-  def auto_augment(self,batch):
-    if batch[0].shape[-1] ==3:
-      for ix in range(0,batch[0].shape[0]):
-        img = Image.fromarray((batch[0][ix]*256).astype(np.uint8))
-        #img.save("pre_transform.jpg")
-        img = self.augment_policy(img)
-        batch[0][ix] = (np.array(img)/256).astype(dtype=np.float16)
-    # else:
-    #    print("Augmentation only works for 3 input channels")
-    return batch
 
 
   def train(self, dataset, remaining_time_budget=None):
@@ -504,36 +414,27 @@ class Model(object):
 
       self.input_shape = self.metadata.get_tensor_size()
       # Reset TF graph
-      dataset = self.prepare_dataset(dataset,is_test=False,resize_shape=self.hard_resize, resize_no_pad=self.no_pad_resize, py_data_processing=self.py_data_processing)
+      dataset = self.prepare_dataset(dataset,is_test=False,resize_shape=self.hard_resize, resize_no_pad=self.no_pad_resize)
 
-      if self.py_data_processing:
-        print("set up feed placeholders")
-        self.train_data, self.train_labels = dataset
-        self.element = tf.placeholder(tf.float32, shape=[None,]+list(self.input_shape))
-        self.labels = tf.placeholder(tf.float32, shape=[None, self.metadata.get_output_size()])
 
-        self.train_batch_pointer = 0
-        self.test_batch_pointer = 0
+      # initialize iterators
+      dataset = dataset.batch(self.batch_size).prefetch(1)
+      dataset = dataset.repeat(-1)
+      self.train_iterator = dataset.make_one_shot_iterator()
+      self.train_iterator_handle = self.tf_session.run(self.train_iterator.string_handle())
 
-      else:
-        # initialize iterators
-        dataset = dataset.batch(self.batch_size).prefetch(1)
-        dataset = dataset.repeat(-1)
-        self.train_iterator = dataset.make_one_shot_iterator()
-        self.train_iterator_handle = self.tf_session.run(self.train_iterator.string_handle())
+      # init the model, metrics and training operator:
+      # handle based iterator
+      self.iterator_feed_handle = tf.placeholder(tf.string, shape=[])
+      iterator = tf.data.Iterator.from_string_handle(
+        self.iterator_feed_handle, self.train_iterator.output_types)
 
-        # init the model, metrics and training operator:
-        # handle based iterator
-        self.iterator_feed_handle = tf.placeholder(tf.string, shape=[])
-        iterator = tf.data.Iterator.from_string_handle(
-          self.iterator_feed_handle, self.train_iterator.output_types)
+      element, labels = iterator.get_next()
+      self.labels = tf.cast(labels, dtype=tf.float32)
+      self.element = tf.squeeze(element, axis=1)
 
-        element, labels = iterator.get_next()
-        self.labels = tf.cast(labels, dtype=tf.float32)
-        self.element = tf.squeeze(element, axis=1)
-
-        #set shape of iterator element such that dense works
-        self.element.set_shape((None,) + self.input_shape)
+      #set shape of iterator element such that dense works
+      self.element.set_shape((None,) + self.input_shape)
 
       #build model
       logits, predictions = self.model(self.element)
@@ -581,42 +482,15 @@ class Model(object):
       saver1 = tf.train.Saver(var_list=all_variables)
       saver1.restore(self.tf_session, latest_checkpoint)
     
-      # Create the Saveru:
-      # var_list = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES)
-      # update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
-      # #saver = tf.train.Saver(var_list=var_list+update_ops)
-      # saver = tf.train.Saver()
-      # if latest_checkpoint is None:
-      #   self.tf_session.run(init_new_vars_op)
-      # else:
-      #   try:
-      #     saver.restore(self.tf_session, latest_checkpoint)
-      #   except:
-      #     logger.info("only restore scope Model")
-      #     self.tf_session.run(init_new_vars_op)
-      #     var_list2 = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope="Model")
-      #     update_ops2 = tf.get_collection(tf.GraphKeys.UPDATE_OPS, scope="Model")
-      #     saver = tf.train.Saver(var_list=var_list2+update_ops2)
-      #     saver.restore(self.tf_session, latest_checkpoint)
-      #     saver = tf.train.Saver(var_list=var_list+update_ops)
-      # self.saver = saver
-    
-    # Restoring the checkpoint or initialize the weights and start the training:
-    sample_count = 0
-    while sample_count < int(600): # when do we return?
-      try:
-        if self.py_data_processing:
-          # feed images directly
-          batch,_ = self.get_next_batch(is_train = True)
-          if self.augment_policy is not None:
-            batch = self.auto_augment(batch)
-          _loss, _labels, _predictions, _logits, _ = self.tf_session.run([self.loss, self.labels, self.predictions, self.logits, self.trainOp],
-                                                                         feed_dict={self.element:batch[0], self.labels:batch[1], self.dropout: 0.5, self.learning_rate: 1e-6, self.is_training: True})
 
-        else:
-          # use tf.data iterator
-          _loss, _labels, _predictions, _logits, _ = self.tf_session.run([self.loss, self.labels, self.predictions, self.logits, self.trainOp],
-                                                                         feed_dict={self.iterator_feed_handle: self.train_iterator_handle, self.dropout: 0.5, self.learning_rate: 1e-6, self.is_training: True})
+    # Do Training
+    sample_count = 0
+    while sample_count < int(20): # when do we return?
+      try:
+
+        # use tf.data iterator
+        _loss, _labels, _predictions, _logits, _ = self.tf_session.run([self.loss, self.labels, self.predictions, self.logits, self.trainOp],
+                                                                       feed_dict={self.iterator_feed_handle: self.train_iterator_handle, self.dropout: 0.5, self.learning_rate: 1e-6, self.is_training: True})
         _predictions = np.argmax(_predictions,-1)
         sample_count += 1
         try:
@@ -662,37 +536,32 @@ class Model(object):
       if self.hard_resize is not None:
         tar_size = self.hard_resize
       else:
-        tar_size = self.mean_sizes
-      dataset = self.prepare_dataset(dataset, is_test=True, resize_shape=tar_size, resize_no_pad=self.no_pad_resize, py_data_processing=self.py_data_processing)
+        if min(self.metadata.get_tensor_size()) < 1:
+          tar_size = self.mean_sizes
+        else:
+          tar_size = np.array(self.metadata.get_tensor_size()[0:2])
+      dataset = self.prepare_dataset(dataset, is_test=True, resize_shape=tar_size, resize_no_pad=self.no_pad_resize)
 
-      if self.py_data_processing:
-        self.test_data = dataset[0]
-      else:
-        dataset = dataset.batch(self.batch_size).prefetch(1)
-        self.test_iterator = dataset.make_initializable_iterator()
-        self.test_iterator_handle = self.tf_session.run(self.test_iterator.string_handle())
 
-    if not self.py_data_processing:
-      self.tf_session.run(self.test_iterator.initializer)
+      dataset = dataset.batch(self.batch_size).prefetch(1)
+      self.test_iterator = dataset.make_initializable_iterator()
+      self.test_iterator_handle = self.tf_session.run(self.test_iterator.string_handle())
+
+
+    self.tf_session.run(self.test_iterator.initializer)
 
     # Restoring the checkpoint and start the evaluation:
     all_predictions = np.zeros([1, self.metadata.get_output_size()])
     sample_count = 0
     while True:
       try:
-        if self.py_data_processing:
-          batch, epoch_done = self.get_next_batch(is_train=False)
-          _predictions = self.tf_session.run(self.predictions, feed_dict={self.element: batch[0], self.dropout: 0, self.is_training: False})
-        else:
-          _predictions = self.tf_session.run(self.predictions, feed_dict={self.iterator_feed_handle: self.test_iterator_handle, self.dropout: 0, self.is_training: False})
+        _predictions = self.tf_session.run(self.predictions, feed_dict={self.iterator_feed_handle: self.test_iterator_handle, self.dropout: 0, self.is_training: False})
         if len(_predictions.shape) < 2:
           all_predictions =np.concatenate((all_predictions, self.np_one_hot(_predictions)), axis=0)
         else: 
           all_predictions =np.concatenate((all_predictions, _predictions), axis=0)
         sample_count += 1
         #print("sample_count "+ str(sample_count))
-        if self.py_data_processing and epoch_done:
-          break
       except tf.errors.OutOfRangeError:
         break
     logger.info("Number of test examples: {}".format(sample_count))
