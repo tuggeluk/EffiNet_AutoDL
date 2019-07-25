@@ -29,6 +29,8 @@ def efficientnet_params(model_name):
   """Get efficientnet params based on model name."""
   params_dict = {
       # (width_coefficient, depth_coefficient, resolution, dropout_rate)
+      'efficientnet-b2xmini': (0.3, 0.3, 128, 0.5),
+      'efficientnet-bmini': (0.2, 0.4, 128, 0.5),
       'efficientnet-b0': (1.0, 1.0, 224, 0.2),
       'efficientnet-b1': (1.0, 1.1, 240, 0.2),
       'efficientnet-b2': (1.1, 1.2, 260, 0.3),
@@ -201,7 +203,7 @@ def build_model(images,
 
   with tf.variable_scope(model_name):
     model = efficientnet_model.Model(blocks_args, global_params)
-    logits = model(images, training=training)
+    logits = model(images, training=training, features_only = True)
 
   logits = tf.identity(logits, 'logits')
   return logits, model.endpoints

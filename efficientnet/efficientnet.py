@@ -8,7 +8,7 @@ class EfficientNet(object):
 
         self.scores=None
         self.model_name = model_name
-        self.skip_load_=skip_load
+        self.skip_load_= skip_load
         self.params={"num_classes":num_classes}
 
         _, _, image_size, _ = efficientnet_builder.efficientnet_params(model_name)

@@ -431,6 +431,7 @@ class Model(tf.keras.Model):
             if is_reduction:
               self.endpoints['reduction_%s/%s' % (reduction_idx, k)] = v
     self.endpoints['global_pool'] = outputs
+    print(len(tf.get_default_graph().as_graph_def().node))
 
     if not features_only:
       # Calls final layers and returns logits.

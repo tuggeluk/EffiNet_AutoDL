@@ -55,9 +55,9 @@ from efficientnet import EfficientNet
 #from resnet import ResNet
 
 import threading
-threads = [
-    threading.Thread(target=lambda: tf.Session())
-]
+
+
+threads = [threading.Thread(target=lambda: tf.Session())]
 [t.start() for t in threads]
 
 class Model(object):
@@ -69,6 +69,10 @@ class Model(object):
       metadata: an AutoDLMetadata object. Its definition can be found in
           AutoDL_ingestion_program/dataset.py
     """
+
+    self.number_of_labels = metadata.get_output_size()
+    self.input_shape = metadata.get_tensor_size()
+
     self.done_training = False
     self.metadata = metadata
 
@@ -87,11 +91,13 @@ class Model(object):
     self.learning_rate = tf.placeholder(tf.float32)
     self.batch_size = 64
     self.max_edge = 256
+    self.min_edge = 64
+    self.default_factor = 0.5
 
-    self.lr = 0.001
+    self.lr = 0.005
     self.wd = 1e-5
-
     self.fc_size = 256
+    self.network_code = 'efficientnet-b0small'
 
     text_file = open("config.txt",  "r")
     conf = text_file.read()
@@ -101,14 +107,15 @@ class Model(object):
     self.wd = float(conf[1])
     self.max_edge = int(conf[2])
     self.fc_size = int(conf[3])
+    self.network_code = conf[4]
 
-    self.do_multilabel_check = True
+    self.do_multilabel_check = False
 
     self.hard_resize = None
     self.no_pad_resize = False
 
     #self.pretain_path = os.path.join(_HERE(),"pretrained_models/res18")
-    self.pretain_path = os.path.join(_HERE(), "pretrained_models/eff/efficientnet-b0")
+    self.pretain_path = os.path.join(_HERE(), "pretrained_models/eff/"+self.network_code)
 
     #tf.reset_default_graph()
     [t.join() for t in threads]
@@ -125,150 +132,35 @@ class Model(object):
     os.system('nvcc --version')
     logger.info("Output of the command line 'nvclock':")
     os.system('nvclock')
-    
+    self.iterator_feed_handle, self.labels, self.logits, self.predictions, self.loss, self.accuracy, self.recall, self.trainOp, self.is_training = [None]*9
+
+    load_method = "None"
+
+    # does not work !!!
+    if load_method == "process":
+      from multiprocessing import Process, Queue
+      self.qu = Queue()
+      self.preproc_thread = Process(target=init_model, args=(self.tf_session, metadata, self.pretain_path, self.fc_size, self.wd, self.lr,self.network_code, self.qu))
+      self.preproc_thread.daemon = True
+      self.preproc_thread.start()
+
+    elif load_method == "thread":
+      import queue
+      self.qu = queue.Queue()
+      self.preproc_thread = threading.Thread(target=init_model(self.tf_session, metadata, self.pretain_path, self.fc_size, self.wd, self.lr,self.network_code, self.qu))
+      self.preproc_thread.daemon = True
+      self.preproc_thread.start()
+
+    else:
+      import queue
+      self.qu = queue.Queue()
+      self.preproc_thread = None
+      init_model(self.tf_session, metadata, self.pretain_path, self.fc_size, self.wd, self.lr, self.network_code, self.qu)
+
   def np_one_hot(self, preds):
     b = np.zeros((preds.shape[0], self.number_of_labels))
     b[np.arange(preds.shape[0]), preds.astype(dtype=np.int32)] = 1
     return b
-    
-
-
-
-  def model(self, images, keep_prob=1.0, number_of_classes=2, is_training=True):
-
-    self.number_of_labels = self.metadata.get_output_size()
-    self.dropout = tf.placeholder(tf.float32)
-    self.is_training = tf.placeholder(tf.bool)
-    # create the base pre-trained model
-
-    net = images
-    if self.metadata.get_tensor_size()[-1] != 3:
-      with tf.variable_scope("Preprocessing"):
-        net = tf.layers.conv2d(net, filters=3, kernel_size=[3, 3], padding="SAME")
-
-
-    #** Efficient Net **
-    base_model = EfficientNet(model_name="efficientnet-b0", num_classes=256)
-
-    #use no specific scope
-    net, endpoints = base_model.model(net, True)
-    net = endpoints["block_15/expansion_output"]
-    #net = tf.layers.flatten(net)
-    net = tf.reduce_mean(net, [1, 2])
-
-    with tf.variable_scope("FullyConnected"):
-      # if self.isMultilabel:
-      #   net = tf.contrib.layers.fully_connected(net, num_outputs=self.number_of_labels*2)
-      #   #net = tf.layers.dropout(net, rate=self.dropout)
-      #   net = tf.reshape(net, [-1, self.number_of_labels, 2])
-      # else:
-      #   net = tf.contrib.layers.fully_connected(net, num_outputs=self.number_of_labels)
-      #   #net = tf.layers.dropout(net, rate=self.dropout)
-      # net = tf.layers.dropout(
-      #   inputs=net, rate=0.3,
-      #   training=self.is_training)
-      net = tf.layers.dense(inputs=net, units=self.fc_size, activation=tf.nn.relu)
-      net = tf.layers.dropout(
-        inputs=net, rate=0.5,
-        training=self.is_training)
-      net = tf.layers.dense(inputs=net, units=self.number_of_labels)
-
-    # **Resnet-18**
-    # base_model = ResNet(tf.train.get_global_step(), self.is_training, self.number_of_labels)
-    # net = base_model.build_tower(net)
-
-
-
-          
-    logits = net
-    probabilities = tf.nn.sigmoid(logits, name="sigmoid_tensor")
-
-    return logits, probabilities
-
-
-  def multilabel_loss_compute(self, labels, logits):
-    one_hot_labels = tf.one_hot(indices=tf.cast(labels, dtype=tf.uint8), depth=2)
-    logits = tf.nn.softmax(logits, axis=-1)+1e-6
-    loss0 = tf.divide(tf.reduce_sum(tf.multiply(tf.reduce_sum(tf.multiply(one_hot_labels, -tf.log(logits)), axis=-1), 1-labels)), 1e-6+tf.reduce_sum(1-labels))
-    loss1 = tf.divide(tf.reduce_sum(tf.multiply(tf.reduce_sum(tf.multiply(one_hot_labels, -tf.log(logits)), axis=-1),   labels)), 1e-6+tf.reduce_sum(  labels))  
-    return tf.add(loss0, loss1)
-
-
-  def multiclass_loss_compute(self,labels,logits, weights=None):
-    if weights is None:
-      loss = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits_v2(labels=labels, logits=logits))
-    else:
-      weighted_logits = tf.multiply(weights, logits)
-      loss = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits_v2(labels=labels, logits=weighted_logits))
-    return loss
-
-  def sigmoid_cross_entropy_with_logits(self, labels=None, logits=None):
-    """Re-implementation of this function:
-      https://www.tensorflow.org/api_docs/python/tf/nn/sigmoid_cross_entropy_with_logits
-
-    Let z = labels, x = logits, then return the sigmoid cross entropy
-      max(x, 0) - x * z + log(1 + exp(-abs(x)))
-    (Then sum over all classes.)
-    """
-    labels = tf.cast(labels, dtype=tf.float32)
-    relu_logits = tf.nn.relu(logits)
-    exp_logits = tf.exp(- tf.abs(logits))
-    sigmoid_logits = tf.log(1 + exp_logits)
-    element_wise_xent = relu_logits - labels * logits + sigmoid_logits
-
-    return tf.reduce_sum(element_wise_xent)
-
-
-  def AddRegularizationLoss(self, regularization):
-    self.trainable_variables = tf.global_variables()
-    self.reg_loss = tf.Variable(initial_value=0, dtype=tf.float32, trainable=False)
-    for item in self.trainable_variables:
-      if not "bias" in item.name:
-        self.reg_loss = tf.add(self.reg_loss, tf.nn.l2_loss(item))
-    return tf.add(self.loss, regularization*self.reg_loss)
-
-
-  def TrainOp(self, loss, scope=None, learning_rate=0.256, momentum=0.9, optimizer=tf.train.MomentumOptimizer):
-    optimizer = tf.train.RMSPropOptimizer(learning_rate=learning_rate, momentum=0.9, decay=0.9, epsilon=1e-3)
-    var_list = tf.global_variables()  # tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope=scope)
-    self.reg_loss = tf.Variable(initial_value=0, dtype=tf.float32, trainable=False)
-    for item in var_list:
-      self.reg_loss = tf.add(self.reg_loss, tf.nn.l2_loss(item))
-    update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS, scope=scope)
-    with tf.control_dependencies(update_ops):
-      # with tf.variable_scope("Optimizer", reuse=tf.AUTO_REUSE):
-      gvs = optimizer.compute_gradients(loss)
-      capped_gvs = [(tf.clip_by_value(grad, -1., 1.), var) for grad, var in gvs]
-      train_op = optimizer.apply_gradients(capped_gvs)
-      # train_op = optimizer.minimize(loss, var_list=var_list)
-    with tf.control_dependencies([train_op]):
-      optimizer2 = tf.train.MomentumOptimizer(learning_rate=1e-5 / 2, momentum=0)
-      train_op2 = optimizer2.minimize(self.reg_loss, var_list=var_list)
-    return tf.group(train_op, train_op2)
-
-  def simple_TrainOp(self, loss):
-    optimizer = tf.train.AdamOptimizer(0.001)
-    train_op = optimizer.minimize(
-      loss=loss,
-      global_step=tf.train.get_global_step())
-    return train_op
-
-
-  def TrainOp_EffiNet(self, loss):
-    optimizer = tf.contrib.opt.AdamWOptimizer(
-    weight_decay=self.wd,
-    learning_rate=self.lr,
-    beta1=0.9,
-    beta2=0.999,
-    epsilon=1e-08,
-    use_locking=False,
-    name='AdamW'
-    )
-    train_op = optimizer.minimize(
-      loss=loss,
-      global_step=tf.train.get_global_step())
-    return train_op
-
 
   def prepare_dataset(self, dataset, is_test=False, resize_shape=None, resize_no_pad=False):
 
@@ -330,7 +222,10 @@ class Model(object):
       if min(self.metadata.get_tensor_size()) < 1:
         resize_shape = self.mean_sizes
       else:
-        resize_shape = np.array(self.metadata.get_tensor_size()[0:2])
+        resize_shape = np.array(self.metadata.get_tensor_size()[0:2][::-1])
+
+    if min(resize_shape) > self.min_edge:
+      resize_shape = (resize_shape*self.default_factor).astype(np.int)
     if max(resize_shape) > self.max_edge:
       resize_shape = (resize_shape/(max(resize_shape)/self.max_edge)).astype(np.int)
 
@@ -412,7 +307,7 @@ class Model(object):
 
     if self.train_iterator_handle is None and self.train_data is None:
 
-      self.input_shape = self.metadata.get_tensor_size()
+
       # Reset TF graph
       dataset = self.prepare_dataset(dataset,is_test=False,resize_shape=self.hard_resize, resize_no_pad=self.no_pad_resize)
 
@@ -423,65 +318,17 @@ class Model(object):
       self.train_iterator = dataset.make_one_shot_iterator()
       self.train_iterator_handle = self.tf_session.run(self.train_iterator.string_handle())
 
-      # init the model, metrics and training operator:
-      # handle based iterator
-      self.iterator_feed_handle = tf.placeholder(tf.string, shape=[])
-      iterator = tf.data.Iterator.from_string_handle(
-        self.iterator_feed_handle, self.train_iterator.output_types)
+      #self.iterator_feed_handle, self.labels, self.logits, self.predictions, self.loss, self.accuracy, self.recall, self.trainOp, self.is_training = None
+      if self.preproc_thread is not None:
+        self.preproc_thread.join()
+      return_elements = []
+      for x in [self.iterator_feed_handle, self.labels, self.logits, self.predictions, self.loss, self.accuracy, self.recall, self.trainOp, self.is_training]:
+        return_elements.append(self.qu.get())
 
-      element, labels = iterator.get_next()
-      self.labels = tf.cast(labels, dtype=tf.float32)
-      self.element = tf.squeeze(element, axis=1)
+      [self.iterator_feed_handle, self.labels, self.logits, self.predictions, self.loss, self.accuracy, self.recall, self.trainOp, self.is_training] = return_elements
 
-      #set shape of iterator element such that dense works
-      self.element.set_shape((None,) + self.input_shape)
 
-      #build model
-      logits, predictions = self.model(self.element)
 
-      self.logits = logits
-      # if self.isMultilabel:
-      #   logger.info("Loss function: Mutli-label loss function!")
-      #   self.loss = self.multilabel_loss_compute(self.labels, logits)
-      # else:
-      #   logger.info("Loss function: Softmax Cross Entropy!")
-      #   self.loss = self.multiclass_loss_compute(self.labels, logits, self.balance_weights)
-
-      self.loss = self.sigmoid_cross_entropy_with_logits(self.labels, self.logits)
-
-      #self.AddRegularizationLoss(regularization)
-      self.predictions = tf.cast(predictions, dtype=tf.float32)
-      self.accuracy = tf.reduce_mean(tf.cast(tf.equal(self.labels, self.predictions), dtype=tf.float32))
-      self.recall = tf.divide(tf.reduce_sum(tf.multiply(tf.cast(tf.equal(self.labels, self.predictions), dtype=tf.float32), self.labels)), tf.reduce_sum(self.labels))
-      
-      #self.trainOp = self.TrainOp(self.loss, learning_rate=self.learning_rate)
-      self.trainOp = self.TrainOp_EffiNet(self.loss)
-
-      logger.info("Shape of dataset: {}".format(self.metadata.get_tensor_size()))
-      logger.info("Number of input: {}".format(self.input_shape))
-      logger.info("Number of classes: {}".format(self.metadata.get_output_size()))
-
-      # Weights initialization:
-      init_new_vars_op = tf.variables_initializer(tf.global_variables())
-      self.tf_session.run(init_new_vars_op)
-
-      ##############################
-      #   pretrained model(s) here #
-      ##############################
-      # Find the latest checkpoint:
-      latest_checkpoint = tf.train.latest_checkpoint(self.pretain_path)
-
-      # Load pretrained
-      all_variables = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES)
-      all_variables = [x for x in all_variables
-                       if "Adam" not in x.name
-                       and "FullyConnected" not in x.name
-                       and "Preprocessing" not in x.name
-                       and "_power" not in x.name
-                       and "head" not in x.name]
-      saver1 = tf.train.Saver(var_list=all_variables)
-      saver1.restore(self.tf_session, latest_checkpoint)
-    
 
     # Do Training
     sample_count = 0
@@ -490,7 +337,7 @@ class Model(object):
 
         # use tf.data iterator
         _loss, _labels, _predictions, _logits, _ = self.tf_session.run([self.loss, self.labels, self.predictions, self.logits, self.trainOp],
-                                                                       feed_dict={self.iterator_feed_handle: self.train_iterator_handle, self.dropout: 0.5, self.learning_rate: 1e-6, self.is_training: True})
+                                                                       feed_dict={self.iterator_feed_handle: self.train_iterator_handle, self.learning_rate: 1e-6, self.is_training: True})
         _predictions = np.argmax(_predictions,-1)
         sample_count += 1
         try:
@@ -539,7 +386,7 @@ class Model(object):
         if min(self.metadata.get_tensor_size()) < 1:
           tar_size = self.mean_sizes
         else:
-          tar_size = np.array(self.metadata.get_tensor_size()[0:2])
+          tar_size = np.array(self.metadata.get_tensor_size()[0:2][::-1])
       dataset = self.prepare_dataset(dataset, is_test=True, resize_shape=tar_size, resize_no_pad=self.no_pad_resize)
 
 
@@ -555,7 +402,7 @@ class Model(object):
     sample_count = 0
     while True:
       try:
-        _predictions = self.tf_session.run(self.predictions, feed_dict={self.iterator_feed_handle: self.test_iterator_handle, self.dropout: 0, self.is_training: False})
+        _predictions = self.tf_session.run(self.predictions, feed_dict={self.iterator_feed_handle: self.test_iterator_handle, self.is_training: False})
         if len(_predictions.shape) < 2:
           all_predictions =np.concatenate((all_predictions, self.np_one_hot(_predictions)), axis=0)
         else: 
@@ -575,6 +422,200 @@ class Model(object):
 
     self.FirstIteration = False
     return predictions
+
+
+def init_model(tf_session, metadata, pretain_path, fc_size, wd, lr,network_code, qu):
+  # init the model, metrics and training operator:
+  # handle based iterator
+  iterator_feed_handle = tf.placeholder(tf.string, shape=[])
+  iterator = tf.data.Iterator.from_string_handle(
+    iterator_feed_handle, (tf.float32, tf.float32))
+
+  element, labels = iterator.get_next()
+  labels = tf.cast(labels, dtype=tf.float32)
+  element = tf.squeeze(element, axis=1)
+
+  # set shape of iterator element such that dense works
+  element.set_shape((None, None, None, metadata.get_tensor_size()[-1]))
+
+  # build model
+  logits, predictions, is_training = model(element, metadata, fc_size, network_code)
+
+  logits = logits
+  # if self.isMultilabel:
+  #   logger.info("Loss function: Mutli-label loss function!")
+  #   self.loss = self.multilabel_loss_compute(self.labels, logits)
+  # else:
+  #   logger.info("Loss function: Softmax Cross Entropy!")
+  #   self.loss = self.multiclass_loss_compute(self.labels, logits, self.balance_weights)
+
+  loss = sigmoid_cross_entropy_with_logits(labels, logits)
+
+  # self.AddRegularizationLoss(regularization)
+  predictions = tf.cast(predictions, dtype=tf.float32)
+  accuracy = tf.reduce_mean(tf.cast(tf.equal(labels, predictions), dtype=tf.float32))
+  recall = tf.divide(tf.reduce_sum(tf.multiply(tf.cast(tf.equal(labels, predictions), dtype=tf.float32), labels)), tf.reduce_sum(labels))
+
+  # self.trainOp = self.TrainOp(self.loss, learning_rate=self.learning_rate)
+  trainOp = TrainOp_EffiNet(loss, wd, lr)
+
+  logger.info("Shape of dataset: {}".format(metadata.get_tensor_size()))
+  #logger.info("Number of input: {}".format(input_shape))
+  logger.info("Number of classes: {}".format(metadata.get_output_size()))
+
+  # Weights initialization:
+  init_new_vars_op = tf.variables_initializer(tf.global_variables())
+  tf_session.run(init_new_vars_op)
+
+  ##############################
+  #   pretrained model(s) here #
+  ##############################
+  # Find the latest checkpoint:
+  latest_checkpoint = tf.train.latest_checkpoint(pretain_path)
+
+  # Load pretrained
+  # all_variables = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES)
+  # all_variables = [x for x in all_variables
+  #                  if "Adam" not in x.name
+  #                  and "FullyConnected" not in x.name
+  #                  and "Preprocessing" not in x.name
+  #                  and "_power" not in x.name
+  #                  and "head" not in x.name]
+  # saver1 = tf.train.Saver(var_list=all_variables)
+  # saver1.restore(tf_session, latest_checkpoint)
+
+  for x in [iterator_feed_handle, labels, logits, predictions, loss, accuracy, recall, trainOp, is_training]:
+    qu.put(x)
+
+  return
+
+def model(images, metadata, fc_size, network_code):
+
+  number_of_labels = metadata.get_output_size()
+  is_training = tf.placeholder(tf.bool)
+  # create the base pre-trained model
+
+  net = images
+  if metadata.get_tensor_size()[-1] != 3:
+    with tf.variable_scope("Preprocessing"):
+      net = tf.layers.conv2d(net, filters=3, kernel_size=[3, 3], padding="SAME")
+
+  # ** Efficient Net **
+  base_model = EfficientNet(model_name=network_code, num_classes=256)
+
+  # use no specific scope
+  net, endpoints = base_model.model(net, True)
+  net = endpoints['global_pool']
+  # net = tf.layers.flatten(net)
+  net = tf.reduce_mean(net, [1, 2])
+
+  with tf.variable_scope("FullyConnected"):
+    # if self.isMultilabel:
+    #   net = tf.contrib.layers.fully_connected(net, num_outputs=self.number_of_labels*2)
+    #   #net = tf.layers.dropout(net, rate=self.dropout)
+    #   net = tf.reshape(net, [-1, self.number_of_labels, 2])
+    # else:
+    #   net = tf.contrib.layers.fully_connected(net, num_outputs=self.number_of_labels)
+    #   #net = tf.layers.dropout(net, rate=self.dropout)
+    # net = tf.layers.dropout(
+    #   inputs=net, rate=0.3,
+    #   training=self.is_training)
+    net = tf.layers.dense(inputs=net, units=fc_size, activation=tf.nn.relu)
+    net = tf.layers.dropout(
+      inputs=net, rate=0.5,
+      training=is_training)
+    net = tf.layers.dense(inputs=net, units=number_of_labels)
+
+  # **Resnet-18**
+  # base_model = ResNet(tf.train.get_global_step(), self.is_training, self.number_of_labels)
+  # net = base_model.build_tower(net)
+
+  logits = net
+  probabilities = tf.nn.sigmoid(logits, name="sigmoid_tensor")
+
+  return logits, probabilities, is_training
+
+def multilabel_loss_compute(labels, logits):
+  one_hot_labels = tf.one_hot(indices=tf.cast(labels, dtype=tf.uint8), depth=2)
+  logits = tf.nn.softmax(logits, axis=-1) + 1e-6
+  loss0 = tf.divide(tf.reduce_sum(tf.multiply(tf.reduce_sum(tf.multiply(one_hot_labels, -tf.log(logits)), axis=-1), 1 - labels)), 1e-6 + tf.reduce_sum(1 - labels))
+  loss1 = tf.divide(tf.reduce_sum(tf.multiply(tf.reduce_sum(tf.multiply(one_hot_labels, -tf.log(logits)), axis=-1), labels)), 1e-6 + tf.reduce_sum(labels))
+  return tf.add(loss0, loss1)
+
+def multiclass_loss_compute(self, labels, logits, weights=None):
+  if weights is None:
+    loss = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits_v2(labels=labels, logits=logits))
+  else:
+    weighted_logits = tf.multiply(weights, logits)
+    loss = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits_v2(labels=labels, logits=weighted_logits))
+  return loss
+
+def sigmoid_cross_entropy_with_logits(labels=None, logits=None):
+  """Re-implementation of this function:
+    https://www.tensorflow.org/api_docs/python/tf/nn/sigmoid_cross_entropy_with_logits
+
+  Let z = labels, x = logits, then return the sigmoid cross entropy
+    max(x, 0) - x * z + log(1 + exp(-abs(x)))
+  (Then sum over all classes.)
+  """
+  labels = tf.cast(labels, dtype=tf.float32)
+  relu_logits = tf.nn.relu(logits)
+  exp_logits = tf.exp(- tf.abs(logits))
+  sigmoid_logits = tf.log(1 + exp_logits)
+  element_wise_xent = relu_logits - labels * logits + sigmoid_logits
+
+  return tf.reduce_sum(element_wise_xent)
+
+def AddRegularizationLoss(regularization, loss):
+  trainable_variables = tf.global_variables()
+  reg_loss = tf.Variable(initial_value=0, dtype=tf.float32, trainable=False)
+  for item in trainable_variables:
+    if not "bias" in item.name:
+      reg_loss = tf.add(reg_loss, tf.nn.l2_loss(item))
+  return tf.add(loss, regularization * reg_loss)
+
+# def TrainOp(self, loss, scope=None, learning_rate=0.256, momentum=0.9, optimizer=tf.train.MomentumOptimizer):
+#   optimizer = tf.train.RMSPropOptimizer(learning_rate=learning_rate, momentum=0.9, decay=0.9, epsilon=1e-3)
+#   var_list = tf.global_variables()  # tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope=scope)
+#   self.reg_loss = tf.Variable(initial_value=0, dtype=tf.float32, trainable=False)
+#   for item in var_list:
+#     self.reg_loss = tf.add(self.reg_loss, tf.nn.l2_loss(item))
+#   update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS, scope=scope)
+#   with tf.control_dependencies(update_ops):
+#     # with tf.variable_scope("Optimizer", reuse=tf.AUTO_REUSE):
+#     gvs = optimizer.compute_gradients(loss)
+#     capped_gvs = [(tf.clip_by_value(grad, -1., 1.), var) for grad, var in gvs]
+#     train_op = optimizer.apply_gradients(capped_gvs)
+#     # train_op = optimizer.minimize(loss, var_list=var_list)
+#   with tf.control_dependencies([train_op]):
+#     optimizer2 = tf.train.MomentumOptimizer(learning_rate=1e-5 / 2, momentum=0)
+#     train_op2 = optimizer2.minimize(self.reg_loss, var_list=var_list)
+#   return tf.group(train_op, train_op2)
+
+def simple_TrainOp(loss):
+  optimizer = tf.train.AdamOptimizer(0.001)
+  train_op = optimizer.minimize(
+    loss=loss,
+    global_step=tf.train.get_global_step())
+  return train_op
+
+def TrainOp_EffiNet(loss, wd, lr):
+  optimizer = tf.contrib.opt.AdamWOptimizer(
+    weight_decay=wd,
+    learning_rate=lr,
+    beta1=0.9,
+    beta2=0.999,
+    epsilon=1e-08,
+    use_locking=False,
+    name='AdamW'
+  )
+  train_op = optimizer.minimize(
+    loss=loss,
+    global_step=tf.train.get_global_step())
+  return train_op
+
+
+
 
   ##############################################################################
   #### Above 3 methods (__init__, train, test) should always be implemented ####
