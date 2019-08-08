@@ -30,7 +30,7 @@ def efficientnet_params(model_name):
   params_dict = {
       # (width_coefficient, depth_coefficient, resolution, dropout_rate)
       'efficientnet-b2xmini': (0.3, 0.3, 128, 0.5),
-      'efficientnet-bmini': (0.2, 0.4, 128, 0.5),
+      'efficientnet-bmini': (0.8, 0.8, 128, 0.5),
       'efficientnet-b0': (1.0, 1.0, 224, 0.2),
       'efficientnet-b1': (1.0, 1.1, 240, 0.2),
       'efficientnet-b2': (1.1, 1.2, 260, 0.3),
@@ -201,7 +201,8 @@ def build_model(images,
         f.write('global_params= %s\n\n' % str(global_params))
         f.write('blocks_args= %s\n\n' % str(blocks_args))
 
-  with tf.variable_scope(model_name):
+  with tf.variable_scope("efficientnet-b2xmini"): #with tf.variable_scope(model_name): --> due to failed pretraining
+
     model = efficientnet_model.Model(blocks_args, global_params)
     logits = model(images, training=training, features_only = True)
 
