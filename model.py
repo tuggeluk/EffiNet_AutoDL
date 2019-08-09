@@ -57,9 +57,9 @@ class Model(object):
     self.number_of_frames = 10
     self.learning_rate = 0.001
     self.seen_sample = 0
-    self.batch_size = 25
+    self.batch_size = 32
     self.input_size = None
-    self.time_budget = 1200
+    self.time_budget = 300
     self.start = time.time()
     self.test_time = 0
     self.training_time = 0
@@ -346,9 +346,10 @@ class Model(object):
     sample_count = 0
     if self.FirstIteration:
       self.training_steps = int(np.round(np.min([1e2+1, self.metadata.size()/self.batch_size+1])/2))
+      self.training_steps = 50
     else:
       self.training_steps *= 1.5
-      self.training_steps = max(self.training_steps, 200)
+      #self.training_steps = max(self.training_steps, 200)
     start_training = time.time()
     while sample_count < self.training_steps: # when do we return? TODO come up with smart heuristic
       try:

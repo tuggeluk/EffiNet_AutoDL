@@ -3,11 +3,11 @@ import os
 
 
 
-l_rate = [0.001,0.002,0.005]
+l_rate = [0.001]
 l_rate_patience = [100]
 l_rate_decay = [0.5]
-w_decay = [0.000025,0.00025]
-m_edge = [128,64]
+w_decay = [0.000025]
+m_edge = [128]
 fc_size = [256]
 datasets = ["Hammer/", "Pedro/", "Decal/", "cifar100/"]
 #datasets = ["Hammer/", "Decal/"]
@@ -15,8 +15,8 @@ datasets = ["Hammer/", "Pedro/", "Decal/", "cifar100/"]
 network_code = ["efficientnet-bmini"]
 pretraining = ["imagenet"]
 bottleneck_fc = [False]
-batch_size = [32,64]
-dropout = [0.5,0.2]
+batch_size = [32]
+dropout = [0.5]
 
 
 time_budget = 1200
